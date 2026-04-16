@@ -236,6 +236,26 @@ function writeRecord(fields) {
   ]);
 }
 
+function updateRecord(recordId, fields) {
+  return lark([
+    "base", "+record-update",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--record-id", recordId,
+    "--fields", JSON.stringify(fields),
+  ]);
+}
+
+function deleteRecord(recordId) {
+  return lark([
+    "base", "+record-delete",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--record-id", recordId,
+    "--yes",
+  ]);
+}
+
 function sendIM(message) {
   if (!IM_CHAT_ID) return;
   try {
@@ -273,6 +293,27 @@ function listAccounts() {
   console.log("}");
 }
 
+function listRecent(limit = 5) {
+  requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+  const r = lark([
+    "base", "+record-list",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--limit", String(Math.max(1, Math.min(20, Number(limit) || 5))),
+  ]);
+  const ids = r.data.record_id_list || [];
+  const rows = r.data.data || [];
+  const names = r.data.fields || [];
+  const idxType = names.indexOf("交易类型");
+  const idxAmount = names.indexOf("金额");
+  const idxNote = names.indexOf("备注");
+  const idxDate = names.indexOf("日期");
+  console.log("\n最近记录：");
+  rows.forEach((row, i) => {
+    console.log(`${ids[i]} | ${row[idxType] || ""} | ¥${Number(row[idxAmount] || 0).toFixed(2)} | ${row[idxNote] || "-"} | ${row[idxDate] || "-"}`);
+  });
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -280,6 +321,47 @@ async function main() {
 
   if (args.includes("--balance"))       { requireEnv("LARK_APP_TOKEN", "LARK_ACCOUNT_TABLE"); showBalance(); return; }
   if (args.includes("--list-accounts")) { listAccounts(); return; }
+  const listIdx = args.indexOf("--list");
+  if (listIdx !== -1) { listRecent(args[listIdx + 1] || 5); return; }
+  const delIdx = args.indexOf("--delete");
+  if (delIdx !== -1) {
+    requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+    const id = args[delIdx + 1];
+    if (!id) { console.error("Usage: --delete <record_id>"); process.exit(1); }
+    deleteRecord(id);
+    console.log(`✅ Deleted: ${id}`);
+    return;
+  }
+  const updIdx = args.indexOf("--update");
+  if (updIdx !== -1) {
+    requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+    const id = args[updIdx + 1];
+    const setIdx = args.indexOf("--set");
+    const kvRaw = setIdx !== -1 ? args[setIdx + 1] : "";
+    if (!id || !kvRaw) { console.error("Usage: --update <record_id> --set 金额=88,备注=午饭,分类=食"); process.exit(1); }
+    const kv = {};
+    for (const pair of kvRaw.split(",")) {
+      const i = pair.indexOf("=");
+      if (i <= 0) continue;
+      kv[pair.slice(0, i)] = pair.slice(i + 1);
+    }
+    const fields = {};
+    if (kv["金额"]) fields["金额"] = Number(kv["金额"]);
+    if (kv["备注"]) fields["备注"] = kv["备注"];
+    if (kv["日期"]) fields["日期"] = kv["日期"];
+    if (kv["交易类型"]) fields["交易类型"] = kv["交易类型"];
+    if (kv["分类"]) fields["支出分类"] = kv["分类"];
+    if (kv["支出分类"]) fields["支出分类"] = kv["支出分类"];
+    if (kv["收入分类"]) fields["收入分类"] = kv["收入分类"];
+    if (kv["账户"]) {
+      const rid = resolveAccount(kv["账户"]);
+      if (rid) fields["账户"] = [rid];
+    }
+    if (!Object.keys(fields).length) { console.error("No valid update fields"); process.exit(1); }
+    updateRecord(id, fields);
+    console.log(`✅ Updated: ${id} (${Object.keys(fields).join(", ")})`);
+    return;
+  }
 
   const monthIdx = args.indexOf("--monthly");
   if (monthIdx !== -1) {
@@ -318,7 +400,7 @@ async function main() {
   console.log(`[record] ✅ Written: ${recId}`);
 
   const { 交易类型: type, 金额: amt, 账户: acct, 支出分类: cat1, 收入分类: cat2, 备注: note } = parsed;
-  let msg = `✅ 已记账\n类型: ${type}  金额: ¥${amt}`;
+  let msg = `✅ 已记账\nID: ${recId}\n类型: ${type}  金额: ¥${amt}`;
   if (acct)       msg += `  账户: ${acct}`;
   if (cat1||cat2) msg += `  分类: ${cat1||cat2}`;
   if (note)       msg += `\n备注: ${note}`;

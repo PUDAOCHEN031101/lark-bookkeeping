@@ -10,6 +10,10 @@
  *   "借给小明500"      → 负债记录
  *   "微信转招行1000"   → 转账
  *   "查余额"           → 查看账户余额
+ *   "查最近5笔"        → 查询最近记录
+ *   "删除上一笔"       → 删除最新一笔
+ *   "删除 recxxxx"     → 按 ID 删除
+ *   "修改 recxxxx 金额=88 备注=午饭 分类=食 账户=微信" → 按 ID 修改
  *   其他消息           → 返回使用提示
  *
  * Usage:
@@ -206,6 +210,26 @@ function writeRecord(fields) {
   return lark(["base", "+record-upsert", "--base-token", APP_TOKEN, "--table-id", LEDGER_TABLE, "--json", JSON.stringify(fields)]);
 }
 
+function updateRecord(recordId, fields) {
+  return lark([
+    "base", "+record-update",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--record-id", recordId,
+    "--fields", JSON.stringify(fields),
+  ]);
+}
+
+function deleteRecord(recordId) {
+  return lark([
+    "base", "+record-delete",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--record-id", recordId,
+    "--yes",
+  ]);
+}
+
 function sendIM(text) {
   try {
     lark(["im", "+messages-send", "--as", "user", "--chat-id", CHAT_ID, "--text", text]);
@@ -224,6 +248,80 @@ function getBalanceSummary() {
   }
   lines.push(`  ${"合计".padEnd(16)}¥${total.toFixed(2)}`);
   return lines.join("\n");
+}
+
+function listRecentRecords(limit = 5) {
+  const safeLimit = Math.max(1, Math.min(20, Number(limit) || 5));
+  const r = lark([
+    "base", "+record-list",
+    "--base-token", APP_TOKEN,
+    "--table-id", LEDGER_TABLE,
+    "--limit", String(safeLimit),
+  ]);
+  const rows = r.data?.data || [];
+  const ids = r.data?.record_id_list || [];
+  const fields = r.data?.fields || [];
+  const idxType = fields.indexOf("交易类型");
+  const idxAmount = fields.indexOf("金额");
+  const idxNote = fields.indexOf("备注");
+  const idxDate = fields.indexOf("日期");
+  return rows.map((row, i) => ({
+    id: ids[i],
+    type: String(row[idxType] || ""),
+    amount: Number(row[idxAmount] || 0),
+    note: String(row[idxNote] || ""),
+    date: String(row[idxDate] || ""),
+  })).filter(x => x.id);
+}
+
+function summarizeRecentRecords(limit = 5) {
+  const rows = listRecentRecords(limit);
+  if (!rows.length) return "最近没有可用记账记录。";
+  const lines = [`最近 ${rows.length} 笔：`];
+  for (const r of rows) {
+    lines.push(`${r.id} | ${r.type} | ¥${r.amount.toFixed(2)} | ${r.note || "-"} | ${r.date || "-"}`);
+  }
+  return lines.join("\n");
+}
+
+function parseControlCommand(text) {
+  const t = text.trim();
+  if (/^(查余额|余额|balance)$/i.test(t)) return { action: "balance" };
+  if (/^(本月汇总|月报)$/i.test(t)) return { action: "monthly" };
+  const listMatch = t.match(/^(查最近|最近)\s*(\d+)?\s*笔?$/);
+  if (listMatch) return { action: "list", limit: Number(listMatch[2] || 5) };
+  if (/^(撤销上一笔|删除上一笔)$/.test(t)) return { action: "delete_last" };
+  const delMatch = t.match(/^(删除|撤销)\s*(rec[a-zA-Z0-9]+)$/);
+  if (delMatch) return { action: "delete_id", recordId: delMatch[2] };
+  const updateMatch = t.match(/^修改\s*(rec[a-zA-Z0-9]+)\s+(.+)$/);
+  if (updateMatch) {
+    const kv = {};
+    for (const part of updateMatch[2].split(/\s+/)) {
+      const i = part.indexOf("=");
+      if (i <= 0) continue;
+      const k = part.slice(0, i).trim();
+      const v = part.slice(i + 1).trim();
+      if (k && v) kv[k] = v;
+    }
+    return { action: "update", recordId: updateMatch[1], kv };
+  }
+  return null;
+}
+
+function buildUpdateFieldsFromKv(kv) {
+  const fields = {};
+  if (kv["金额"]) fields["金额"] = Number(kv["金额"]);
+  if (kv["备注"]) fields["备注"] = kv["备注"];
+  if (kv["日期"]) fields["日期"] = kv["日期"];
+  if (kv["交易类型"]) fields["交易类型"] = kv["交易类型"];
+  if (kv["账户"]) {
+    const rid = resolveAccount(kv["账户"]);
+    if (rid) fields["账户"] = [rid];
+  }
+  if (kv["支出分类"]) fields["支出分类"] = kv["支出分类"];
+  if (kv["收入分类"]) fields["收入分类"] = kv["收入分类"];
+  if (kv["分类"]) fields["支出分类"] = kv["分类"];
+  return fields;
 }
 
 // ─── Message processing ───────────────────────────────────────────────────────
@@ -253,6 +351,41 @@ async function processMessage(msg) {
 
   log(`Processing: "${text}"`);
 
+  const cmd = parseControlCommand(text);
+  if (cmd) {
+    if (DRY_RUN) { log(`[dry-run] control command: ${JSON.stringify(cmd)}`); return; }
+    try {
+      if (cmd.action === "balance") { sendIM(getBalanceSummary()); return; }
+      if (cmd.action === "monthly") { sendIM("月度汇总请使用命令行: node lark-record.mjs --monthly"); return; }
+      if (cmd.action === "list") { sendIM(summarizeRecentRecords(cmd.limit)); return; }
+      if (cmd.action === "delete_last") {
+        const last = listRecentRecords(1)[0];
+        if (!last) { sendIM("没有可撤销的记录。"); return; }
+        deleteRecord(last.id);
+        sendIM(`✅ 已删除上一笔: ${last.id} ¥${last.amount.toFixed(2)} ${last.note || ""}`.trim());
+        return;
+      }
+      if (cmd.action === "delete_id") {
+        deleteRecord(cmd.recordId);
+        sendIM(`✅ 已删除记录: ${cmd.recordId}`);
+        return;
+      }
+      if (cmd.action === "update") {
+        const fields = buildUpdateFieldsFromKv(cmd.kv || {});
+        if (!Object.keys(fields).length) {
+          sendIM("修改失败：请使用 关键字=值，例如：修改 recxxxx 金额=88 备注=午饭 分类=食 账户=微信");
+          return;
+        }
+        updateRecord(cmd.recordId, fields);
+        sendIM(`✅ 已修改记录: ${cmd.recordId}\n更新字段: ${Object.keys(fields).join(", ")}`);
+        return;
+      }
+    } catch (e) {
+      sendIM(`❌ 操作失败: ${e.message}`);
+      return;
+    }
+  }
+
   let parsed;
   try { parsed = await parseWithAI(text); } catch (e) { log(`AI error: ${e.message}`); return; }
 
@@ -276,9 +409,10 @@ async function processMessage(msg) {
   try {
     const result = writeRecord(fields);
     if (!result.ok && result.code !== 0) throw new Error(`code=${result.code}: ${result.msg}`);
-    log(`✅ Written: ${result?.data?.record?.record_id || "?"}`);
+    const recId = result?.data?.record?.record_id || result?.data?.upserted?.[0]?.record_id || "?";
+    log(`✅ Written: ${recId}`);
     const { 交易类型: type, 金额: amt, 账户: acct, 支出分类: c1, 收入分类: c2, 备注: note } = parsed;
-    let confirmMsg = `✅ 已记账\n类型: ${type}  金额: ¥${amt}`;
+    let confirmMsg = `✅ 已记账\nID: ${recId}\n类型: ${type}  金额: ¥${amt}`;
     if (acct)   confirmMsg += `  账户: ${acct}`;
     if (c1||c2) confirmMsg += `  分类: ${c1||c2}`;
     if (note)   confirmMsg += `\n备注: ${note}`;
