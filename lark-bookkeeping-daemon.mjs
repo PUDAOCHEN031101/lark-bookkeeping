@@ -26,7 +26,7 @@
  */
 
 import { createServer } from "http";
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -53,6 +53,8 @@ const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE;
 const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE;
 const POLL_MS       = Number(process.env.LARK_POLL_MS) || 8_000;
 const POLL_BACKFILL_SECONDS = Number(process.env.LARK_POLL_BACKFILL_SECONDS) || 86_400;
+const EVENT_MODE    = (process.env.LARK_EVENT_MODE || "long").toLowerCase(); // long|webhook|poll
+const LONG_RESTART_MS = Number(process.env.LARK_LONG_RESTART_MS) || 3_000;
 const WEBHOOK_PORT  = Number(process.env.LARK_WEBHOOK_PORT) || 0;
 const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
 const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
@@ -320,6 +322,31 @@ function summarizeRecentRecords(limit = 5) {
   return lines.join("\n");
 }
 
+function readRecentJsonLines(file, limit = 5) {
+  if (!existsSync(file)) return [];
+  try {
+    const lines = readFileSync(file, "utf8").split("\n").map(s => s.trim()).filter(Boolean);
+    const picked = lines.slice(-Math.max(1, Math.min(20, Number(limit) || 5)));
+    const rows = [];
+    for (const line of picked) {
+      try { rows.push(JSON.parse(line)); } catch {}
+    }
+    return rows.reverse();
+  } catch {
+    return [];
+  }
+}
+
+function summarizeFeatureRequests(limit = 5) {
+  const rows = readRecentJsonLines(FEATURE_FILE, limit);
+  if (!rows.length) return "最近没有功能需求记录。";
+  const lines = [`最近 ${rows.length} 条功能需求：`];
+  for (const row of rows) {
+    lines.push(`- ${row.detail || row.raw_text || "(空)"} | ${row.ts || "-"}`);
+  }
+  return lines.join("\n");
+}
+
 function parseControlCommand(text) {
   const t = text.trim();
   if (/^(查余额|余额|balance)$/i.test(t)) return { action: "balance" };
@@ -345,6 +372,8 @@ function parseControlCommand(text) {
   if (feedbackMatch) return { action: "feedback", content: feedbackMatch[1].trim() };
   const featureMatch = t.match(/^(需求|建议|新功能|我要功能)[\s:：]+(.+)$/);
   if (featureMatch) return { action: "feature_request", content: featureMatch[2].trim() };
+  const featureListMatch = t.match(/^查需求\s*(\d+)?\s*条?$/);
+  if (featureListMatch) return { action: "list_features", limit: Number(featureListMatch[1] || 5) };
   return null;
 }
 
@@ -454,6 +483,10 @@ async function processMessage(msg) {
         sendIM(`✅ 已记录新功能需求\n内容: ${cmd.content}`);
         return;
       }
+      if (cmd.action === "list_features") {
+        sendIM(summarizeFeatureRequests(cmd.limit));
+        return;
+      }
     } catch (e) {
       appendFeedbackEntry(text, `命令执行失败: ${e.message}`);
       sendIM(`❌ 操作失败: ${e.message}`);
@@ -528,6 +561,12 @@ function parseWebhookMessage(event) {
     chat_type: event.message.chat_type,
     message_type: event.message.message_type,
   };
+}
+
+function parseLongEventMessage(payload) {
+  const event = payload?.event || payload?.data?.event || payload?.body?.event;
+  if (!event?.message) return null;
+  return parseWebhookMessage(event);
 }
 
 async function handleWebhookEvent(payload) {
@@ -625,6 +664,76 @@ function startWebhookServer() {
   });
 }
 
+async function handleIncomingMessage(msg, eventId = "") {
+  const msgId = msg?.message_id || msg?.id;
+  if (eventId && PROCESSED_EVENT_IDS.has(eventId)) return;
+  if (!msgId || !msg) return;
+  if (CHAT_ID && msg.chat_id && msg.chat_id !== CHAT_ID) return;
+  if (msg.message_type && msg.message_type !== "text") return;
+  if (PROCESSED_IDS.has(msgId)) return;
+
+  if (eventId) PROCESSED_EVENT_IDS.add(eventId);
+  PROCESSED_IDS.add(msgId);
+  persistState();
+  await processMessage(msg);
+}
+
+async function startLongConnectionLoop() {
+  while (true) {
+    log("Long-connection subscribe started");
+    await new Promise((resolve) => {
+      const args = [
+        "event", "+subscribe",
+        "--as", "bot",
+        "--event-types", "im.message.receive_v1",
+        "--quiet",
+      ];
+      const child = spawn("lark-cli", args, {
+        cwd: process.cwd(),
+        env: { ...process.env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let buffer = "";
+      child.stdout.on("data", (chunk) => {
+        buffer += chunk.toString();
+        let idx = buffer.indexOf("\n");
+        while (idx >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (line) {
+            try {
+              const payload = JSON.parse(line);
+              const eventId = payload?.header?.event_id || payload?.event_id || "";
+              const msg = parseLongEventMessage(payload);
+              if (msg) {
+                handleIncomingMessage(msg, eventId).catch(e => log(`Long event process error: ${e.message}`));
+              }
+            } catch {
+              // ignore non-json lines
+            }
+          }
+          idx = buffer.indexOf("\n");
+        }
+      });
+
+      child.stderr.on("data", (chunk) => {
+        const text = chunk.toString().trim();
+        if (text) log(`[long-conn] ${text}`);
+      });
+      child.on("exit", (code, signal) => {
+        log(`Long-connection exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+        resolve();
+      });
+      child.on("error", (e) => {
+        log(`Long-connection spawn error: ${e.message}`);
+        resolve();
+      });
+    });
+    await new Promise(r => setTimeout(r, LONG_RESTART_MS));
+  }
+}
+
 // ─── Logger ───────────────────────────────────────────────────────────────────
 
 function log(msg) {
@@ -663,7 +772,13 @@ async function main() {
   MODEL = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
   log(`Daemon started. Chat: ${CHAT_ID || "(all chats)"}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
 
-  if (WEBHOOK_PORT > 0) {
+  if (EVENT_MODE === "long") {
+    log("Mode: long-connection");
+    await startLongConnectionLoop();
+    return;
+  }
+
+  if (EVENT_MODE === "webhook" && WEBHOOK_PORT > 0) {
     log("Mode: webhook");
     startWebhookServer();
     return;
