@@ -210,6 +210,16 @@ function writeRecord(fields) {
   return lark(["base", "+record-upsert", "--base-token", APP_TOKEN, "--table-id", LEDGER_TABLE, "--json", JSON.stringify(fields)]);
 }
 
+function extractRecordId(result) {
+  return (
+    result?.data?.record?.record_id ??
+    result?.data?.record?.record_id_list?.[0] ??
+    result?.data?.record_id_list?.[0] ??
+    result?.data?.upserted?.[0]?.record_id ??
+    "?"
+  );
+}
+
 function updateRecord(recordId, fields) {
   return lark([
     "base", "+record-update",
@@ -409,7 +419,7 @@ async function processMessage(msg) {
   try {
     const result = writeRecord(fields);
     if (!result.ok && result.code !== 0) throw new Error(`code=${result.code}: ${result.msg}`);
-    const recId = result?.data?.record?.record_id || result?.data?.upserted?.[0]?.record_id || "?";
+    const recId = extractRecordId(result);
     log(`✅ Written: ${recId}`);
     const { 交易类型: type, 金额: amt, 账户: acct, 支出分类: c1, 收入分类: c2, 备注: note } = parsed;
     let confirmMsg = `✅ 已记账\nID: ${recId}\n类型: ${type}  金额: ¥${amt}`;

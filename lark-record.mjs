@@ -236,6 +236,16 @@ function writeRecord(fields) {
   ]);
 }
 
+function extractRecordId(result) {
+  return (
+    result?.data?.record?.record_id ??
+    result?.data?.record?.record_id_list?.[0] ??
+    result?.data?.record_id_list?.[0] ??
+    result?.data?.upserted?.[0]?.record_id ??
+    "?"
+  );
+}
+
 function updateRecord(recordId, fields) {
   return lark([
     "base", "+record-update",
@@ -396,7 +406,7 @@ async function main() {
   const result = writeRecord(fields);
   if (!result.ok && result.code !== 0) { console.error(`[record] Write failed: ${result.msg}`); process.exit(2); }
 
-  const recId = result?.data?.record?.record_id || "?";
+  const recId = extractRecordId(result);
   console.log(`[record] ✅ Written: ${recId}`);
 
   const { 交易类型: type, 金额: amt, 账户: acct, 支出分类: cat1, 收入分类: cat2, 备注: note } = parsed;
