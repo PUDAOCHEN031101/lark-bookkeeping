@@ -51,7 +51,38 @@ const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.j
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
 const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY;
-const MODEL           = "deepseek-ai/DeepSeek-V3";
+const MODEL_FALLBACK  = "deepseek-ai/DeepSeek-V3";
+
+// Optional: SiliconFlow model router (https://github.com/PUDAOCHEN031101/model-router-mcp)
+// Set SILICON_ROUTER_PYTHON + SILICON_ROUTER_CLI in .env to enable dynamic model routing.
+// If not configured, falls back to DeepSeek-V3.
+const ROUTER_PYTHON = process.env.SILICON_ROUTER_PYTHON;
+const ROUTER_CLI    = process.env.SILICON_ROUTER_CLI;
+
+function routeModel(taskDesc) {
+  if (!ROUTER_PYTHON || !ROUTER_CLI || !existsSync(ROUTER_CLI)) return MODEL_FALLBACK;
+  try {
+    const r = spawnSync(
+      ROUTER_PYTHON,
+      ["-B", ROUTER_CLI, "route", taskDesc, "--profile", "siliconflow"],
+      { encoding: "utf8", timeout: 8_000, env: { ...process.env } }
+    );
+    if (r.error || r.status !== 0) throw new Error(r.stderr || r.error?.message);
+    const out = (r.stdout || "").trim();
+    const i = out.indexOf("{");
+    if (i < 0) throw new Error("no JSON");
+    const result = JSON.parse(out.slice(i));
+    const model = result["推荐模型"];
+    if (!model) throw new Error("no model");
+    log(`[router] ${model} (${result["意图分析"]})`);
+    return model;
+  } catch (e) {
+    log(`[router] fallback to ${MODEL_FALLBACK}: ${e.message}`);
+    return MODEL_FALLBACK;
+  }
+}
+
+let MODEL = MODEL_FALLBACK;
 
 const DRY_RUN = process.argv.includes("--dry-run");
 
@@ -267,7 +298,8 @@ async function pollLoop() {
   const processedIds = new Set(state.processedIds || []);
   let lastPollTime = state.lastPollTime || new Date(Date.now() - 60_000).toISOString();
 
-  log(`Daemon started. Chat: ${CHAT_ID}  DryRun: ${DRY_RUN}`);
+  MODEL = routeModel("记账：从用户消息提取金额、账户、分类，输出JSON");
+  log(`Daemon started. Chat: ${CHAT_ID}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
   log(`Polling every ${POLL_MS/1000}s`);
 
   while (true) {

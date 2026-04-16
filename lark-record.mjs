@@ -51,7 +51,34 @@ const SEND_IM       = process.env.LARK_RECORD_SEND_IM !== "0";
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
 const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY;
-const MODEL           = "deepseek-ai/DeepSeek-V3";
+const MODEL_FALLBACK  = "deepseek-ai/DeepSeek-V3";
+
+// Optional: SiliconFlow model router (https://github.com/PUDAOCHEN031101/model-router-mcp)
+const ROUTER_PYTHON = process.env.SILICON_ROUTER_PYTHON;
+const ROUTER_CLI    = process.env.SILICON_ROUTER_CLI;
+
+function routeModel(taskDesc) {
+  if (!ROUTER_PYTHON || !ROUTER_CLI || !existsSync(ROUTER_CLI)) return MODEL_FALLBACK;
+  try {
+    const r = spawnSync(
+      ROUTER_PYTHON,
+      ["-B", ROUTER_CLI, "route", taskDesc, "--profile", "siliconflow"],
+      { encoding: "utf8", timeout: 8_000, env: { ...process.env } }
+    );
+    if (r.error || r.status !== 0) throw new Error(r.stderr || r.error?.message);
+    const out = (r.stdout || "").trim();
+    const i = out.indexOf("{");
+    if (i < 0) throw new Error("no JSON");
+    const result = JSON.parse(out.slice(i));
+    const model = result["推荐模型"];
+    if (!model) throw new Error("no model");
+    console.log(`[router] ${model} (${result["意图分析"]})`);
+    return model;
+  } catch (e) {
+    console.warn(`[router] fallback to ${MODEL_FALLBACK}: ${e.message}`);
+    return MODEL_FALLBACK;
+  }
+}
 
 function requireEnv(...vars) {
   const missing = vars.filter(v => !process.env[v]);
@@ -139,11 +166,12 @@ ${Object.keys(ACCOUNTS).join(" / ") || "（请先配置 config/accounts.json）"
 }`;
 
 async function parseWithAI(input) {
+  const model = routeModel("记账：从用户消息提取金额、账户、分类，输出JSON");
   const resp = await fetch(SILICONFLOW_API, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },
     body: JSON.stringify({
-      model: MODEL,
+      model,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: input },
