@@ -3,3 +3,6 @@ config/accounts.json
 node_modules/
 *.log
 .DS_Store
+.claude/
+.entire/
+.cursor/
