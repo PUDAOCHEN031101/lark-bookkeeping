@@ -347,6 +347,18 @@ function summarizeFeatureRequests(limit = 5) {
   return lines.join("\n");
 }
 
+function summarizeFeedback(limit = 5) {
+  const rows = readRecentJsonLines(FEEDBACK_FILE, limit);
+  if (!rows.length) return "最近没有反馈记录。";
+  const lines = [`最近 ${rows.length} 条反馈：`];
+  for (const row of rows) {
+    const detail = row.detail || row.raw_text || "(空)";
+    const rid = row.last_record_id ? ` | 记录: ${row.last_record_id}` : "";
+    lines.push(`- ${detail}${rid} | ${row.ts || "-"}`);
+  }
+  return lines.join("\n");
+}
+
 function parseControlCommand(text) {
   const t = text.trim();
   if (/^(查余额|余额|balance)$/i.test(t)) return { action: "balance" };
@@ -374,6 +386,8 @@ function parseControlCommand(text) {
   if (featureMatch) return { action: "feature_request", content: featureMatch[2].trim() };
   const featureListMatch = t.match(/^查需求\s*(\d+)?\s*条?$/);
   if (featureListMatch) return { action: "list_features", limit: Number(featureListMatch[1] || 5) };
+  const feedbackListMatch = t.match(/^查反馈\s*(\d+)?\s*条?$/);
+  if (feedbackListMatch) return { action: "list_feedback", limit: Number(feedbackListMatch[1] || 5) };
   return null;
 }
 
@@ -485,6 +499,10 @@ async function processMessage(msg) {
       }
       if (cmd.action === "list_features") {
         sendIM(summarizeFeatureRequests(cmd.limit));
+        return;
+      }
+      if (cmd.action === "list_feedback") {
+        sendIM(summarizeFeedback(cmd.limit));
         return;
       }
     } catch (e) {
