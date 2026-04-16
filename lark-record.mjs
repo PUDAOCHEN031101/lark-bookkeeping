@@ -166,7 +166,7 @@ ${Object.keys(ACCOUNTS).join(" / ") || "（请先配置 config/accounts.json）"
 }`;
 
 async function parseWithAI(input) {
-  const model = routeModel("记账：从用户消息提取金额、账户、分类，输出JSON");
+  const model = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
   const resp = await fetch(SILICONFLOW_API, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },

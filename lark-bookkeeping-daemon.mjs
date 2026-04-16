@@ -298,7 +298,7 @@ async function pollLoop() {
   const processedIds = new Set(state.processedIds || []);
   let lastPollTime = state.lastPollTime || new Date(Date.now() - 60_000).toISOString();
 
-  MODEL = routeModel("记账：从用户消息提取金额、账户、分类，输出JSON");
+  MODEL = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
   log(`Daemon started. Chat: ${CHAT_ID}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
   log(`Polling every ${POLL_MS/1000}s`);
 
