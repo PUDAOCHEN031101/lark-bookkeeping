@@ -58,6 +58,7 @@ const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
 const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
 const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.json`;
 const FEEDBACK_FILE = `${process.env.HOME}/.local/share/lark-bookkeeping/feedback.ndjson`;
+const FEATURE_FILE  = `${process.env.HOME}/.local/share/lark-bookkeeping/feature-requests.ndjson`;
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
 const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY;
@@ -342,6 +343,8 @@ function parseControlCommand(text) {
   }
   const feedbackMatch = t.match(/^反馈[\s:：]+(.+)$/);
   if (feedbackMatch) return { action: "feedback", content: feedbackMatch[1].trim() };
+  const featureMatch = t.match(/^(需求|建议|新功能|我要功能)[\s:：]+(.+)$/);
+  if (featureMatch) return { action: "feature_request", content: featureMatch[2].trim() };
   return null;
 }
 
@@ -371,6 +374,17 @@ function appendFeedbackEntry(rawText, detail, lastRecordId = "") {
     last_record_id: lastRecordId || "",
   };
   appendFileSync(FEEDBACK_FILE, `${JSON.stringify(row, null, 0)}\n`);
+}
+
+function appendFeatureRequestEntry(rawText, detail) {
+  const dir = FEATURE_FILE.substring(0, FEATURE_FILE.lastIndexOf("/"));
+  mkdirSync(dir, { recursive: true });
+  const row = {
+    ts: new Date().toISOString(),
+    raw_text: rawText,
+    detail,
+  };
+  appendFileSync(FEATURE_FILE, `${JSON.stringify(row, null, 0)}\n`);
 }
 
 // ─── Message processing ───────────────────────────────────────────────────────
@@ -435,7 +449,13 @@ async function processMessage(msg) {
         sendIM(`✅ 已收到反馈\n内容: ${cmd.content}\n最近记录: ${last?.id || "-"}`);
         return;
       }
+      if (cmd.action === "feature_request") {
+        appendFeatureRequestEntry(text, cmd.content || "");
+        sendIM(`✅ 已记录新功能需求\n内容: ${cmd.content}`);
+        return;
+      }
     } catch (e) {
+      appendFeedbackEntry(text, `命令执行失败: ${e.message}`);
       sendIM(`❌ 操作失败: ${e.message}`);
       return;
     }
@@ -455,8 +475,10 @@ async function processMessage(msg) {
     if (!DRY_RUN) {
       const recent = listRecentRecords(1)[0];
       if (/(删除|撤销).*(这条|这笔)/.test(text)) {
+        appendFeedbackEntry(text, "自动检测：删除意图未命中", recent?.id || "");
         sendIM(`🤖 我理解你想删除记录，但还没定位到具体 ID。\n可直接发：删除上一笔\n或：删除 ${recent?.id || "recxxxx"}\n也可反馈：反馈 删除意图未命中`);
       } else if (/(不对|错了|不是这个)/.test(text)) {
+        appendFeedbackEntry(text, "自动检测：纠错意图触发", recent?.id || "");
         sendIM(`🤖 收到纠错信号。\n最近记录: ${recent?.id || "-"}\n可发：修改 ${recent?.id || "recxxxx"} 金额=xx 备注=xx\n或发：反馈 你的纠错说明`);
       } else {
         sendIM(`🤖 记账机器人在线\n示例：晚餐68微信 / 工资8000招行 / 借给小明500\n发"查余额"查账户余额`);
@@ -483,6 +505,7 @@ async function processMessage(msg) {
     sendIM(confirmMsg);
   } catch (e) {
     log(`Write failed: ${e.message}`);
+    appendFeedbackEntry(text, `写入失败: ${e.message}`);
     sendIM(`❌ 记账失败: ${e.message}`);
   }
 }
