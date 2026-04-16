@@ -246,6 +246,11 @@ function extractText(msg) {
 async function processMessage(msg) {
   const text = extractText(msg);
   if (!text) return;
+
+  // Skip bot's own confirmation/hint messages to prevent feedback loop
+  if (text.startsWith("✅ 已记账") || text.startsWith("❌ 记账失败") || text.startsWith("🤖 记账机器人")) return;
+  if (text.startsWith("账户余额：")) return;
+
   log(`Processing: "${text}"`);
 
   let parsed;
