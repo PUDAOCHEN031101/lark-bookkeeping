@@ -25,6 +25,7 @@
  *   LARK_CHAT_ID, SILICONFLOW_API_KEY
  */
 
+import { createServer } from "http";
 import { spawnSync } from "child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
@@ -51,6 +52,10 @@ const APP_TOKEN     = process.env.LARK_APP_TOKEN;
 const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE;
 const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE;
 const POLL_MS       = Number(process.env.LARK_POLL_MS) || 8_000;
+const POLL_BACKFILL_SECONDS = Number(process.env.LARK_POLL_BACKFILL_SECONDS) || 86_400;
+const WEBHOOK_PORT  = Number(process.env.LARK_WEBHOOK_PORT) || 0;
+const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
+const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
 const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.json`;
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
@@ -121,14 +126,33 @@ const ACCOUNTS = loadAccounts();
 // ─── State persistence ────────────────────────────────────────────────────────
 
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { processedIds: [], lastPollTime: null };
-  try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return { processedIds: [], lastPollTime: null }; }
+  if (!existsSync(STATE_FILE)) return { processedIds: [], processedEventIds: [], lastPollTime: null };
+  try {
+    const state = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    if (!Array.isArray(state.processedIds)) state.processedIds = [];
+    if (!Array.isArray(state.processedEventIds)) state.processedEventIds = [];
+    if (!Object.prototype.hasOwnProperty.call(state, "lastPollTime")) state.lastPollTime = null;
+    return state;
+  } catch {
+    return { processedIds: [], processedEventIds: [], lastPollTime: null };
+  }
 }
 
 function saveState(state) {
   mkdirSync(STATE_FILE.substring(0, STATE_FILE.lastIndexOf("/")), { recursive: true });
   if (state.processedIds.length > 200) state.processedIds = state.processedIds.slice(-200);
+  if (state.processedEventIds.length > 200) state.processedEventIds = state.processedEventIds.slice(-200);
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+const STATE = loadState();
+const PROCESSED_IDS = new Set(STATE.processedIds || []);
+const PROCESSED_EVENT_IDS = new Set(STATE.processedEventIds || []);
+
+function persistState() {
+  STATE.processedIds = [...PROCESSED_IDS];
+  STATE.processedEventIds = [...PROCESSED_EVENT_IDS];
+  saveState(STATE);
 }
 
 // ─── lark-cli helper ──────────────────────────────────────────────────────────
@@ -300,7 +324,7 @@ function parseControlCommand(text) {
   if (/^(本月汇总|月报)$/i.test(t)) return { action: "monthly" };
   const listMatch = t.match(/^(查最近|最近)\s*(\d+)?\s*笔?$/);
   if (listMatch) return { action: "list", limit: Number(listMatch[2] || 5) };
-  if (/^(撤销上一笔|删除上一笔)$/.test(t)) return { action: "delete_last" };
+  if (/^(撤销上一笔|删除上一笔|删除这条记录|撤销这条记录)$/.test(t)) return { action: "delete_last" };
   const delMatch = t.match(/^(删除|撤销)\s*(rec[a-zA-Z0-9]+)$/);
   if (delMatch) return { action: "delete_id", recordId: delMatch[2] };
   const updateMatch = t.match(/^修改\s*(rec[a-zA-Z0-9]+)\s+(.+)$/);
@@ -433,6 +457,121 @@ async function processMessage(msg) {
   }
 }
 
+function verifyWebhookToken(token) {
+  return !VERIFY_TOKEN || token === VERIFY_TOKEN;
+}
+
+function parseWebhookMessage(event) {
+  if (!event?.message) return null;
+  return {
+    id: event.message.message_id,
+    message_id: event.message.message_id,
+    content: event.message.content,
+    body: { content: event.message.content },
+    sender: {
+      sender_type: event.sender?.sender_type || "user",
+    },
+    chat_id: event.message.chat_id,
+    chat_type: event.message.chat_type,
+    message_type: event.message.message_type,
+  };
+}
+
+async function handleWebhookEvent(payload) {
+  const eventId = payload?.header?.event_id;
+  const event = payload?.event;
+  const msg = parseWebhookMessage(event);
+  const msgId = msg?.message_id || msg?.id;
+
+  if (eventId && PROCESSED_EVENT_IDS.has(eventId)) return;
+  if (!msgId || !msg) return;
+  if (CHAT_ID && msg.chat_id && msg.chat_id !== CHAT_ID) {
+    log(`Skip message from unmatched chat: ${msg.chat_id}`);
+    return;
+  }
+  if (msg.message_type && msg.message_type !== "text") {
+    log(`Skip non-text message: ${msg.message_type}`);
+    return;
+  }
+  if (PROCESSED_IDS.has(msgId)) return;
+
+  if (eventId) PROCESSED_EVENT_IDS.add(eventId);
+  PROCESSED_IDS.add(msgId);
+  persistState();
+
+  try {
+    await processMessage(msg);
+  } catch (e) {
+    log(`Webhook process error: ${e.message}`);
+  }
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", chunk => {
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        reject(new Error("payload too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        reject(new Error(`invalid JSON: ${e.message}`));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function startWebhookServer() {
+  const server = createServer(async (req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: 405, msg: "method not allowed" }));
+      return;
+    }
+
+    try {
+      const payload = await readJsonBody(req);
+      const token = payload?.header?.token || payload?.token || "";
+      if (!verifyWebhookToken(token)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code: 403, msg: "invalid token" }));
+        return;
+      }
+
+      if (payload?.type === "url_verification") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ challenge: payload.challenge }));
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: 0 }));
+
+      if (payload?.header?.event_type === "im.message.receive_v1") {
+        setImmediate(() => {
+          handleWebhookEvent(payload).catch(e => log(`Webhook async error: ${e.message}`));
+        });
+      }
+    } catch (e) {
+      log(`Webhook request error: ${e.message}`);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: 400, msg: e.message }));
+    }
+  });
+
+  server.listen(WEBHOOK_PORT, WEBHOOK_HOST, () => {
+    log(`Webhook server listening on http://${WEBHOOK_HOST}:${WEBHOOK_PORT}`);
+    if (VERIFY_TOKEN) log("Webhook verification token enabled");
+  });
+}
+
 // ─── Logger ───────────────────────────────────────────────────────────────────
 
 function log(msg) {
@@ -442,14 +581,10 @@ function log(msg) {
 // ─── Poll loop ────────────────────────────────────────────────────────────────
 
 async function pollLoop() {
-  validateConfig();
-  const state = loadState();
-  const processedIds = new Set(state.processedIds || []);
-  let lastPollTime = state.lastPollTime || new Date(Date.now() - 60_000).toISOString();
-
-  MODEL = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
-  log(`Daemon started. Chat: ${CHAT_ID}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
-  log(`Polling every ${POLL_MS/1000}s`);
+  const backfillMs = Math.max(0, POLL_BACKFILL_SECONDS) * 1000;
+  let lastPollTime =
+    STATE.lastPollTime ||
+    new Date(Date.now() - backfillMs).toISOString();
 
   while (true) {
     try {
@@ -457,18 +592,33 @@ async function pollLoop() {
       const now = new Date().toISOString();
       for (const msg of msgs) {
         const msgId = msg.message_id || msg.id;
-        if (!msgId || processedIds.has(msgId)) continue;
-        if (msg.sender?.sender_type === "app") { processedIds.add(msgId); continue; }
-        processedIds.add(msgId);
+        if (!msgId || PROCESSED_IDS.has(msgId)) continue;
+        if (msg.sender?.sender_type === "app") { PROCESSED_IDS.add(msgId); continue; }
+        PROCESSED_IDS.add(msgId);
         await processMessage(msg);
       }
       lastPollTime = now;
-      state.lastPollTime = now;
-      state.processedIds = [...processedIds];
-      saveState(state);
+      STATE.lastPollTime = now;
+      persistState();
     } catch (e) { log(`Poll error (will retry): ${e.message}`); }
     await new Promise(r => setTimeout(r, POLL_MS));
   }
 }
 
-pollLoop().catch(e => { console.error("Fatal:", e.message); process.exit(1); });
+async function main() {
+  validateConfig();
+  MODEL = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
+  log(`Daemon started. Chat: ${CHAT_ID || "(all chats)"}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
+
+  if (WEBHOOK_PORT > 0) {
+    log("Mode: webhook");
+    startWebhookServer();
+    return;
+  }
+
+  log("Mode: polling");
+  log(`Polling every ${POLL_MS / 1000}s`);
+  await pollLoop();
+}
+
+main().catch(e => { console.error("Fatal:", e.message); process.exit(1); });
