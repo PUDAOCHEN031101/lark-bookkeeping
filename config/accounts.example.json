@@ -1,0 +1,10 @@
+{
+  "_comment": "将账户中文名映射到飞书账户表的 record_id。运行 node lark-record.mjs --list-accounts 自动生成此文件。",
+  "微信零钱": "recXXXXXXXX",
+  "微信零钱通": "recYYYYYYYY",
+  "余额宝": "recZZZZZZZZ",
+  "招商金葵花": "recAAAAAAAA",
+  "建行": "recBBBBBBBB",
+  "农行": "recCCCCCCCC",
+  "现金": "recDDDDDDDD"
+}

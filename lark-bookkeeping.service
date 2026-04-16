@@ -1,0 +1,20 @@
+[Unit]
+Description=Lark Bookkeeping Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 修改为你的仓库克隆路径
+WorkingDirectory=%h/lark-bookkeeping
+ExecStart=/usr/bin/node lark-bookkeeping-daemon.mjs
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 如果 node 不在 /usr/bin，修改 PATH：
+# Environment=PATH=/home/youruser/node22/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
