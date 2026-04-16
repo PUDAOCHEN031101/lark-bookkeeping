@@ -27,7 +27,7 @@
 
 import { createServer } from "http";
 import { spawnSync } from "child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -57,6 +57,7 @@ const WEBHOOK_PORT  = Number(process.env.LARK_WEBHOOK_PORT) || 0;
 const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
 const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
 const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.json`;
+const FEEDBACK_FILE = `${process.env.HOME}/.local/share/lark-bookkeeping/feedback.ndjson`;
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
 const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY;
@@ -324,7 +325,7 @@ function parseControlCommand(text) {
   if (/^(本月汇总|月报)$/i.test(t)) return { action: "monthly" };
   const listMatch = t.match(/^(查最近|最近)\s*(\d+)?\s*笔?$/);
   if (listMatch) return { action: "list", limit: Number(listMatch[2] || 5) };
-  if (/^(撤销上一笔|删除上一笔|删除这条记录|撤销这条记录)$/.test(t)) return { action: "delete_last" };
+  if (/^(撤销上一笔|删除上一笔|删除这条|撤销这条|删除这笔|撤销这笔|删除这条记录|撤销这条记录)$/.test(t)) return { action: "delete_last" };
   const delMatch = t.match(/^(删除|撤销)\s*(rec[a-zA-Z0-9]+)$/);
   if (delMatch) return { action: "delete_id", recordId: delMatch[2] };
   const updateMatch = t.match(/^修改\s*(rec[a-zA-Z0-9]+)\s+(.+)$/);
@@ -339,6 +340,8 @@ function parseControlCommand(text) {
     }
     return { action: "update", recordId: updateMatch[1], kv };
   }
+  const feedbackMatch = t.match(/^反馈[\s:：]+(.+)$/);
+  if (feedbackMatch) return { action: "feedback", content: feedbackMatch[1].trim() };
   return null;
 }
 
@@ -356,6 +359,18 @@ function buildUpdateFieldsFromKv(kv) {
   if (kv["收入分类"]) fields["收入分类"] = kv["收入分类"];
   if (kv["分类"]) fields["支出分类"] = kv["分类"];
   return fields;
+}
+
+function appendFeedbackEntry(rawText, detail, lastRecordId = "") {
+  const dir = FEEDBACK_FILE.substring(0, FEEDBACK_FILE.lastIndexOf("/"));
+  mkdirSync(dir, { recursive: true });
+  const row = {
+    ts: new Date().toISOString(),
+    raw_text: rawText,
+    detail,
+    last_record_id: lastRecordId || "",
+  };
+  appendFileSync(FEEDBACK_FILE, `${JSON.stringify(row, null, 0)}\n`);
 }
 
 // ─── Message processing ───────────────────────────────────────────────────────
@@ -414,6 +429,12 @@ async function processMessage(msg) {
         sendIM(`✅ 已修改记录: ${cmd.recordId}\n更新字段: ${Object.keys(fields).join(", ")}`);
         return;
       }
+      if (cmd.action === "feedback") {
+        const last = listRecentRecords(1)[0];
+        appendFeedbackEntry(text, cmd.content || "", last?.id || "");
+        sendIM(`✅ 已收到反馈\n内容: ${cmd.content}\n最近记录: ${last?.id || "-"}`);
+        return;
+      }
     } catch (e) {
       sendIM(`❌ 操作失败: ${e.message}`);
       return;
@@ -431,7 +452,16 @@ async function processMessage(msg) {
 
   if (parsed.not_bookkeeping) {
     log("  → Not bookkeeping, sending hint");
-    if (!DRY_RUN) sendIM(`🤖 记账机器人在线\n示例：晚餐68微信 / 工资8000招行 / 借给小明500\n发"查余额"查账户余额`);
+    if (!DRY_RUN) {
+      const recent = listRecentRecords(1)[0];
+      if (/(删除|撤销).*(这条|这笔)/.test(text)) {
+        sendIM(`🤖 我理解你想删除记录，但还没定位到具体 ID。\n可直接发：删除上一笔\n或：删除 ${recent?.id || "recxxxx"}\n也可反馈：反馈 删除意图未命中`);
+      } else if (/(不对|错了|不是这个)/.test(text)) {
+        sendIM(`🤖 收到纠错信号。\n最近记录: ${recent?.id || "-"}\n可发：修改 ${recent?.id || "recxxxx"} 金额=xx 备注=xx\n或发：反馈 你的纠错说明`);
+      } else {
+        sendIM(`🤖 记账机器人在线\n示例：晚餐68微信 / 工资8000招行 / 借给小明500\n发"查余额"查账户余额`);
+      }
+    }
     return;
   }
 
