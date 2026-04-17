@@ -24,8 +24,8 @@ import { VOUCHER_MODEL_SET } from "./scripts/lib/silicon-voucher-models.mjs";
 import {
   BOOKKEEPING_MULTI_INSTRUCTIONS,
   entriesFromAiJson,
-  parseAiJsonFromContent,
 } from "./scripts/lib/bookkeeping-multi.mjs";
+import { getLlmApiKey, getLlmChatUrl, parseBookkeepingWithLLM } from "./scripts/lib/bookkeeping-parse-llm.mjs";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 
@@ -57,6 +57,7 @@ const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.j
 const FEEDBACK_FILE = `${process.env.HOME}/.local/share/lark-bookkeeping/feedback.ndjson`;
 const FEATURE_FILE  = `${process.env.HOME}/.local/share/lark-bookkeeping/feature-requests.ndjson`;
 
+/** 记账解析可改 BOOKKEEPING_LLM_CHAT_URL；OCR 仍可用 LARK_OCR_CHAT_URL 指硅基 */
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
 const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY || "";
 const MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3";
@@ -267,27 +268,21 @@ const PARSE_TIMEOUT_MS = Math.max(
 const PARSE_RETRIES = Math.max(1, Math.min(5, Number(process.env.LARK_BOOKKEEPING_PARSE_RETRIES) || 2));
 
 async function parseWithAI(text) {
+  const chatUrl = getLlmChatUrl();
+  const apiKey = getLlmApiKey();
   let lastErr;
   for (let attempt = 1; attempt <= PARSE_RETRIES; attempt++) {
     try {
-      const resp = await fetch(SILICONFLOW_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: text },
-          ],
-          temperature: 0.1,
-          max_tokens: 2_000,
-        }),
+      return await parseBookkeepingWithLLM({
+        chatUrl,
+        apiKey,
+        model: MODEL,
+        systemPrompt: SYSTEM_PROMPT,
+        userText: text,
         signal: AbortSignal.timeout(PARSE_TIMEOUT_MS),
+        onLog: (s) => log(s),
+        maxTokens: 2_000,
       });
-      if (!resp.ok) throw new Error(`AI HTTP ${resp.status}`);
-      const data = await resp.json();
-      const content = data?.choices?.[0]?.message?.content || "";
-      return parseAiJsonFromContent(content);
     } catch (e) {
       lastErr = e;
       const msg = e?.message || String(e);
@@ -579,9 +574,9 @@ function appendFeatureRequestEntry(rawText, detail) {
 }
 
 async function chatWithAI(text) {
-  const resp = await fetch(SILICONFLOW_API, {
+  const resp = await fetch(getLlmChatUrl(), {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${getLlmApiKey()}` },
     body: JSON.stringify({
       model: MODEL,
       messages: [
@@ -670,9 +665,11 @@ function downloadMessageImageDataUrl(msg) {
 }
 
 async function runDeepSeekOcr(imageUrlOrDataUrl) {
-  const resp = await fetch(SILICONFLOW_API, {
+  const ocrUrl = process.env.LARK_OCR_CHAT_URL || SILICONFLOW_API;
+  const ocrKey = getLlmApiKey() || SILICONFLOW_KEY;
+  const resp = await fetch(ocrUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${ocrKey}` },
     body: JSON.stringify({
       model: OCR_MODEL,
       messages: [
@@ -1186,8 +1183,10 @@ async function pollLoop() {
 }
 
 async function main() {
-  if (!APP_TOKEN || !LEDGER_TABLE || !ACCOUNT_TABLE || !SILICONFLOW_KEY) {
-    throw new Error("missing required env: LARK_BOOKKEEPING_APP_TOKEN/LARK_BOOKKEEPING_LEDGER_TABLE/LARK_BOOKKEEPING_ACCOUNT_TABLE/SILICONFLOW_API_KEY");
+  if (!APP_TOKEN || !LEDGER_TABLE || !ACCOUNT_TABLE || !getLlmApiKey()) {
+    throw new Error(
+      "missing required env: LARK_* tables + LLM key (SILICONFLOW_API_KEY or OPENAI_API_KEY or LLM_API_KEY)"
+    );
   }
   if (!CHAT_ID && WEBHOOK_PORT <= 0) {
     throw new Error("missing required env: LARK_BOOKKEEPING_CHAT_ID (polling mode)");

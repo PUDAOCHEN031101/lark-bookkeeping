@@ -28,8 +28,8 @@ import { fileURLToPath } from "url";
 import {
   BOOKKEEPING_MULTI_INSTRUCTIONS,
   entriesFromAiJson,
-  parseAiJsonFromContent,
 } from "./scripts/lib/bookkeeping-multi.mjs";
+import { getLlmApiKey, getLlmChatUrl, parseBookkeepingWithLLM } from "./scripts/lib/bookkeeping-parse-llm.mjs";
 
 // ─── Load .env if present ──────────────────────────────────────────────────────
 
@@ -54,8 +54,6 @@ const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE || process.env.LARK_BOOKKEE
 const IM_CHAT_ID    = process.env.LARK_CHAT_ID || process.env.LARK_RECORD_CHAT_ID || "";
 const SEND_IM       = process.env.LARK_RECORD_SEND_IM !== "0";
 
-const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
-const SILICONFLOW_KEY = process.env.SILICONFLOW_API_KEY;
 const MODEL_FALLBACK  = "deepseek-ai/DeepSeek-V3";
 
 // Optional: SiliconFlow model router (https://github.com/PUDAOCHEN031101/model-router-mcp)
@@ -168,24 +166,16 @@ const RECORD_PARSE_TIMEOUT_MS = Math.max(
 
 async function parseWithAI(input) {
   const model = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
-  const resp = await fetch(SILICONFLOW_API, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${SILICONFLOW_KEY}` },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: input },
-      ],
-      temperature: 0.1,
-      max_tokens: 2_000,
-    }),
+  return parseBookkeepingWithLLM({
+    chatUrl: getLlmChatUrl(),
+    apiKey: getLlmApiKey(),
+    model,
+    systemPrompt: SYSTEM_PROMPT,
+    userText: input,
     signal: AbortSignal.timeout(RECORD_PARSE_TIMEOUT_MS),
+    onLog: (s) => console.warn(s),
+    maxTokens: 2_000,
   });
-  if (!resp.ok) throw new Error(`AI HTTP ${resp.status}`);
-  const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || "";
-  return parseAiJsonFromContent(content);
 }
 
 // ─── Account resolution ───────────────────────────────────────────────────────
@@ -407,8 +397,8 @@ async function main() {
     return;
   }
 
-  if (!APP_TOKEN || !LEDGER_TABLE || !SILICONFLOW_KEY) {
-    console.error("[record] Missing LARK_APP_TOKEN / LARK_LEDGER_TABLE / SILICONFLOW_API_KEY（或 LARK_BOOKKEEPING_* 别名）");
+  if (!APP_TOKEN || !LEDGER_TABLE || !getLlmApiKey()) {
+    console.error("[record] Missing LARK_APP_TOKEN / LARK_LEDGER_TABLE + LLM key（SILICONFLOW_API_KEY / OPENAI_API_KEY / LLM_API_KEY 或 LARK_BOOKKEEPING_* 别名）");
     process.exit(1);
   }
 
