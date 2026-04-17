@@ -2,7 +2,7 @@
 /**
  * lark-record.mjs — AI-powered natural language bookkeeping via lark-cli
  *
- * Flow: NL input → SiliconFlow DeepSeek-V3 → lark-cli +record-upsert → IM confirmation
+ * Flow: NL input → LLM (OpenAI-compatible, provider-selectable) → lark-cli +record-upsert → IM confirmation
  *
  * Usage:
  *   node lark-record.mjs "晚餐68微信"
@@ -16,7 +16,8 @@
  *
  * Environment variables (see .env.example):
  *   LARK_APP_TOKEN, LARK_LEDGER_TABLE, LARK_ACCOUNT_TABLE,
- *   LARK_CHAT_ID, LARK_RECORD_SEND_IM, SILICONFLOW_API_KEY
+ *   LARK_CHAT_ID, LARK_RECORD_SEND_IM,
+ *   plus one key from: SILICONFLOW_API_KEY / OPENAI_API_KEY / LLM_API_KEY
  *
  * Exit codes: 0 ok, 1 parse/config error, 2 write error
  */
@@ -237,11 +238,11 @@ function extractRecordId(result) {
 
 function updateRecord(recordId, fields) {
   return lark([
-    "base", "+record-update",
+    "base", "+record-upsert",
     "--base-token", APP_TOKEN,
     "--table-id", LEDGER_TABLE,
     "--record-id", recordId,
-    "--fields", JSON.stringify(fields),
+    "--json", JSON.stringify(fields),
   ]);
 }
 

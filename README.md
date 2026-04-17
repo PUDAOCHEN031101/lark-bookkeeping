@@ -58,6 +58,17 @@ cd lark-bookkeeping
 cp .env.example .env
 ```
 
+#### 4.1) 选择你的 LLM 提供商（默认硅基，可自选）
+
+本项目走 **OpenAI-compatible `/chat/completions`** 协议，用户可自行选择提供商：
+
+- 默认（最省事）：只填 `SILICONFLOW_API_KEY`（走硅基流动默认地址）
+- OpenAI 官方：设置 `OPENAI_BASE_URL=https://api.openai.com/v1` + `OPENAI_API_KEY`
+- 其他兼容网关：设置 `BOOKKEEPING_LLM_CHAT_URL=https://your-gateway/v1/chat/completions` + `LLM_API_KEY`
+
+优先级（地址）：`BOOKKEEPING_LLM_CHAT_URL` > `OPENAI_BASE_URL + /chat/completions` > 硅基默认地址  
+优先级（密钥）：`SILICONFLOW_API_KEY` > `OPENAI_API_KEY` > `LLM_API_KEY`
+
 #### wow-harness（治理锚点，无子模块）
 
 远程仓库 **不包含** `wow-harness` 上游代码；根目录 **`.wow-harness/`** 内仅提交 **MANIFEST 等治理锚点**（与主站 Obsidian 对齐），**运行时 `state/` 等由 `.gitignore` 排除**，不进入 Git。
@@ -75,6 +86,16 @@ LARK_LEDGER_TABLE=收支明细表table_id
 LARK_ACCOUNT_TABLE=账户表table_id
 LARK_CHAT_ID=oc_你的chat_id
 SILICONFLOW_API_KEY=sk-xxxx
+```
+
+若你不用硅基，可改成：
+
+```env
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=sk-xxxx
+# 或
+# BOOKKEEPING_LLM_CHAT_URL=https://your-gateway/v1/chat/completions
+# LLM_API_KEY=sk-xxxx
 ```
 
 配置账户映射 `config/accounts.json`（账户名 -> record_id）后，启动：
@@ -152,6 +173,17 @@ git clone https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
 cd lark-bookkeeping
 cp .env.example .env
 ```
+
+#### 2.1) Choose your LLM provider (default SiliconFlow, optional others)
+
+This project uses an **OpenAI-compatible `/chat/completions`** interface, so users can pick their own provider:
+
+- Easiest default: set `SILICONFLOW_API_KEY` only
+- OpenAI: set `OPENAI_BASE_URL=https://api.openai.com/v1` + `OPENAI_API_KEY`
+- Any compatible gateway: set `BOOKKEEPING_LLM_CHAT_URL=https://your-gateway/v1/chat/completions` + `LLM_API_KEY`
+
+URL priority: `BOOKKEEPING_LLM_CHAT_URL` > `OPENAI_BASE_URL + /chat/completions` > SiliconFlow default  
+Key priority: `SILICONFLOW_API_KEY` > `OPENAI_API_KEY` > `LLM_API_KEY`
 
 For first-time setup, we recommend starting from the author's FIRE template Base, then adapting field names as needed:
 
