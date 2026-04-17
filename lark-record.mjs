@@ -25,6 +25,11 @@ import { spawnSync } from "child_process";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import {
+  BOOKKEEPING_MULTI_INSTRUCTIONS,
+  entriesFromAiJson,
+  parseAiJsonFromContent,
+} from "./scripts/lib/bookkeeping-multi.mjs";
 
 // ─── Load .env if present ──────────────────────────────────────────────────────
 
@@ -43,10 +48,10 @@ loadEnv();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const APP_TOKEN     = process.env.LARK_APP_TOKEN;
-const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE;
-const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE;
-const IM_CHAT_ID    = process.env.LARK_CHAT_ID;
+const APP_TOKEN     = process.env.LARK_APP_TOKEN || process.env.LARK_BOOKKEEPING_APP_TOKEN || "";
+const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE || process.env.LARK_BOOKKEEPING_LEDGER_TABLE || "";
+const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE || process.env.LARK_BOOKKEEPING_ACCOUNT_TABLE || "";
+const IM_CHAT_ID    = process.env.LARK_CHAT_ID || process.env.LARK_RECORD_CHAT_ID || "";
 const SEND_IM       = process.env.LARK_RECORD_SEND_IM !== "0";
 
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
@@ -77,15 +82,6 @@ function routeModel(taskDesc) {
   } catch (e) {
     console.warn(`[router] fallback to ${MODEL_FALLBACK}: ${e.message}`);
     return MODEL_FALLBACK;
-  }
-}
-
-function requireEnv(...vars) {
-  const missing = vars.filter(v => !process.env[v]);
-  if (missing.length) {
-    console.error(`[record] Missing required env vars: ${missing.join(", ")}`);
-    console.error("  Copy .env.example to .env and fill in your values.");
-    process.exit(1);
   }
 }
 
@@ -163,7 +159,12 @@ ${Object.keys(ACCOUNTS).join(" / ") || "（请先配置 config/accounts.json）"
   "借款人": "",
   "备注": "晚餐",
   "日期": ""
-}`;
+}` + BOOKKEEPING_MULTI_INSTRUCTIONS;
+
+const RECORD_PARSE_TIMEOUT_MS = Math.max(
+  15_000,
+  Number(process.env.LARK_BOOKKEEPING_PARSE_TIMEOUT_MS || process.env.LARK_PARSE_TIMEOUT_MS) || 120_000
+);
 
 async function parseWithAI(input) {
   const model = routeModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
@@ -177,16 +178,14 @@ async function parseWithAI(input) {
         { role: "user", content: input },
       ],
       temperature: 0.1,
-      max_tokens: 300,
+      max_tokens: 2_000,
     }),
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(RECORD_PARSE_TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`AI HTTP ${resp.status}`);
   const data = await resp.json();
   const content = data?.choices?.[0]?.message?.content || "";
-  const m = content.match(/\{[\s\S]*\}/);
-  if (!m) throw new Error(`AI no JSON: ${content.slice(0, 200)}`);
-  return JSON.parse(m[0]);
+  return parseAiJsonFromContent(content);
 }
 
 // ─── Account resolution ───────────────────────────────────────────────────────
@@ -275,8 +274,24 @@ function sendIM(message) {
   }
 }
 
+function buildConfirmation(parsed) {
+  const type = parsed["交易类型"];
+  const amt = parsed["金额"];
+  const acct = parsed["账户"] || parsed["转出账户"] || "";
+  const cat = parsed["支出分类"] || parsed["收入分类"] || "";
+  const note = parsed["备注"] || "";
+  let msg = `✅ 已记账\n类型: ${type}  金额: ¥${amt}`;
+  if (acct) msg += `  账户: ${acct}`;
+  if (cat) msg += `  分类: ${cat}`;
+  if (note) msg += `\n备注: ${note}`;
+  return msg;
+}
+
 function showBalance() {
-  requireEnv("LARK_APP_TOKEN", "LARK_ACCOUNT_TABLE");
+  if (!APP_TOKEN || !ACCOUNT_TABLE) {
+    console.error("[record] Missing app token or account table (LARK_APP_TOKEN / LARK_ACCOUNT_TABLE 或 LARK_BOOKKEEPING_* 别名)");
+    process.exit(1);
+  }
   const r = lark(["base", "+record-list", "--base-token", APP_TOKEN, "--table-id", ACCOUNT_TABLE, "--limit", "50"]);
   const rows = r.data.data || [], fields = r.data.fields || [];
   const nameIdx = fields.indexOf("账户名称"), balIdx = fields.indexOf("当前余额");
@@ -290,7 +305,10 @@ function showBalance() {
 }
 
 function listAccounts() {
-  requireEnv("LARK_APP_TOKEN", "LARK_ACCOUNT_TABLE");
+  if (!APP_TOKEN || !ACCOUNT_TABLE) {
+    console.error("[record] Missing app token or account table");
+    process.exit(1);
+  }
   const r = lark(["base", "+record-list", "--base-token", APP_TOKEN, "--table-id", ACCOUNT_TABLE, "--limit", "100"]);
   const rows = r.data.data || [], fields = r.data.fields || [];
   const ids = r.data.record_id_list || [];
@@ -304,7 +322,10 @@ function listAccounts() {
 }
 
 function listRecent(limit = 5) {
-  requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+  if (!APP_TOKEN || !LEDGER_TABLE) {
+    console.error("[record] Missing app token or ledger table");
+    process.exit(1);
+  }
   const r = lark([
     "base", "+record-list",
     "--base-token", APP_TOKEN,
@@ -329,13 +350,16 @@ function listRecent(limit = 5) {
 async function main() {
   const args = process.argv.slice(2);
 
-  if (args.includes("--balance"))       { requireEnv("LARK_APP_TOKEN", "LARK_ACCOUNT_TABLE"); showBalance(); return; }
+  if (args.includes("--balance"))       { showBalance(); return; }
   if (args.includes("--list-accounts")) { listAccounts(); return; }
   const listIdx = args.indexOf("--list");
   if (listIdx !== -1) { listRecent(args[listIdx + 1] || 5); return; }
   const delIdx = args.indexOf("--delete");
   if (delIdx !== -1) {
-    requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+    if (!APP_TOKEN || !LEDGER_TABLE) {
+      console.error("[record] Missing app token or ledger table");
+      process.exit(1);
+    }
     const id = args[delIdx + 1];
     if (!id) { console.error("Usage: --delete <record_id>"); process.exit(1); }
     deleteRecord(id);
@@ -344,7 +368,10 @@ async function main() {
   }
   const updIdx = args.indexOf("--update");
   if (updIdx !== -1) {
-    requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE");
+    if (!APP_TOKEN || !LEDGER_TABLE) {
+      console.error("[record] Missing app token or ledger table");
+      process.exit(1);
+    }
     const id = args[updIdx + 1];
     const setIdx = args.indexOf("--set");
     const kvRaw = setIdx !== -1 ? args[setIdx + 1] : "";
@@ -380,7 +407,10 @@ async function main() {
     return;
   }
 
-  requireEnv("LARK_APP_TOKEN", "LARK_LEDGER_TABLE", "SILICONFLOW_API_KEY");
+  if (!APP_TOKEN || !LEDGER_TABLE || !SILICONFLOW_KEY) {
+    console.error("[record] Missing LARK_APP_TOKEN / LARK_LEDGER_TABLE / SILICONFLOW_API_KEY（或 LARK_BOOKKEEPING_* 别名）");
+    process.exit(1);
+  }
 
   const dryRun = args.includes("--dry-run");
   const input  = args.filter(a => !a.startsWith("--")).join(" ").trim();
@@ -391,31 +421,50 @@ async function main() {
   }
 
   console.log(`[record] Parsing: "${input}"`);
-  const parsed = await parseWithAI(input).catch(e => { console.error(`[record] Parse failed: ${e.message}`); process.exit(1); });
-  console.log("[record] Parsed:", JSON.stringify(parsed, null, 2));
-
-  if (!parsed["金额"] || !parsed["交易类型"]) {
-    console.error("[record] Missing required fields");
+  let parsed;
+  try {
+    parsed = await parseWithAI(input);
+    console.log("[record] Parsed:", JSON.stringify(parsed, null, 2));
+  } catch (e) {
+    console.error(`[record] Parse failed: ${e.message}`);
     process.exit(1);
   }
 
-  const fields = buildFields(parsed);
+  const entries = entriesFromAiJson(parsed);
+  if (!entries.length) {
+    console.error("[record] Missing required fields (金额/交易类型)，或多笔数组为空");
+    process.exit(1);
+  }
 
-  if (dryRun) { console.log("[dry-run] Would write:", JSON.stringify(fields, null, 2)); return; }
+  if (dryRun) {
+    for (const ent of entries) {
+      console.log("[dry-run] Would write:", JSON.stringify(buildFields(ent), null, 2));
+    }
+    return;
+  }
 
-  const result = writeRecord(fields);
-  if (!result.ok && result.code !== 0) { console.error(`[record] Write failed: ${result.msg}`); process.exit(2); }
+  const confirmParts = [];
+  try {
+    for (const ent of entries) {
+      const fields = buildFields(ent);
+      const result = writeRecord(fields);
+      if (!result.ok && result.code !== 0) throw new Error(result.msg || "write failed");
+      const recId = extractRecordId(result);
+      console.log(`[record] ✅ Written: ${recId}`);
+      const body = buildConfirmation(ent).replace(/^✅ 已记账\n/, "").trim();
+      confirmParts.push(`ID ${recId} | ${body}`);
+    }
+  } catch (e) {
+    console.error(`[record] Write failed: ${e.message}`);
+    process.exit(2);
+  }
 
-  const recId = extractRecordId(result);
-  console.log(`[record] ✅ Written: ${recId}`);
-
-  const { 交易类型: type, 金额: amt, 账户: acct, 支出分类: cat1, 收入分类: cat2, 备注: note } = parsed;
-  let msg = `✅ 已记账\nID: ${recId}\n类型: ${type}  金额: ¥${amt}`;
-  if (acct)       msg += `  账户: ${acct}`;
-  if (cat1||cat2) msg += `  分类: ${cat1||cat2}`;
-  if (note)       msg += `\n备注: ${note}`;
-  console.log(msg);
-  if (SEND_IM) sendIM(msg);
+  const confirmMsg =
+    entries.length > 1
+      ? `✅ 已记账 共 ${entries.length} 笔\n${confirmParts.map((p, i) => `${i + 1}. ${p}`).join("\n")}`
+      : `✅ 已记账\n${confirmParts[0]}`;
+  console.log(confirmMsg);
+  if (SEND_IM) sendIM(confirmMsg);
 }
 
 main().catch(e => { console.error("[record] Fatal:", e.message); process.exit(1); });
