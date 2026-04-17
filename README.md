@@ -40,6 +40,16 @@
 
 开源仓库不强制内置视图 JSON；你在飞书 UI 里搭好视图后，同一 `app_token` 下所有客户端（聊天记账、CLI）写入的数据会立刻反映在视图里。
 
+### 3.1) 推荐先用作者模板（更快上手）
+
+如果你是第一次使用，推荐先复用作者长期在用的 FIRE 账本模板，再按需改字段：
+
+- 模板入口（飞书 Base）：<https://ks2ynpxs58.feishu.cn/base/EyQJblriPa1R46sJYNrcI1gQndd?table=tblsHPal0ZohtEF3&view=vewor4lDIV>
+- 最少保证两张表：`收支明细` + `账户`
+- 字段名建议与本项目脚本保持一致（金额、分类、账户、备注、时间等），可显著减少首次对接成本
+
+> 说明：若你使用自己的空白 Base，也完全可以；只是首次字段映射与视图搭建会更慢。
+
 ### 4) 快速开始
 
 ```bash
@@ -142,6 +152,11 @@ git clone https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
 cd lark-bookkeeping
 cp .env.example .env
 ```
+
+For first-time setup, we recommend starting from the author's FIRE template Base, then adapting field names as needed:
+
+- Template entry: <https://ks2ynpxs58.feishu.cn/base/EyQJblriPa1R46sJYNrcI1gQndd?table=tblsHPal0ZohtEF3&view=vewor4lDIV>
+- Keep at least two tables: `ledger` and `account`
 
 Set `.env` values:
 
