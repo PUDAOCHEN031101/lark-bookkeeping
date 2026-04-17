@@ -6,3 +6,16 @@ node_modules/
 .claude/
 .entire/
 .cursor/
+
+# wow-harness：与主仓一致，运行时永不提交（MANIFEST 等若放在根目录可提交；state 不行）
+.wow-harness/state/
+.towow/state/
+.towow/guard/
+.towow/metrics/
+.towow/logs/
+.towow/progress/
+.towow/proposals/
+.towow/active-review-agents/
+
+# 可选：本机单独 clone 的 wow-harness 上游，勿提交进本仓库
+vendor/wow-harness/

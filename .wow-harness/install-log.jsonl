@@ -1,0 +1,8 @@
+{"ts": "2026-04-10T12:59:10", "event": "bundle_copied", "details": "tier=adapt"}
+{"ts": "2026-04-10T12:59:10", "event": "scaffold_created", "details": "paths=14"}
+{"ts": "2026-04-10T12:59:10", "event": "gitignore_appended", "details": ""}
+{"ts": "2026-04-10T12:59:10", "event": "index_slot_filled", "details": ""}
+{"ts": "2026-04-10T12:59:10", "event": "install_complete", "details": "tier=adapt projects=1"}
+{"ts": "2026-04-13T12:42:00", "event": "bundle_copied", "details": "tier=drop-in"}
+{"ts": "2026-04-13T12:42:00", "event": "index_slot_filled", "details": ""}
+{"ts": "2026-04-13T12:42:00", "event": "install_complete", "details": "tier=drop-in projects=1"}

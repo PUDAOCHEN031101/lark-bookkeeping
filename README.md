@@ -43,22 +43,19 @@
 ### 4) 快速开始
 
 ```bash
-git clone --recurse-submodules https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
+git clone https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
 cd lark-bookkeeping
-# 若已克隆但未拉子模块：
-git submodule update --init --recursive
 cp .env.example .env
 ```
 
-#### wow-harness 子模块（治理 / Cursor·Claude 兼容）
+#### wow-harness（治理锚点，无子模块）
 
-本仓库包含 **[wow-harness](https://github.com/PUDAOCHEN031101/wow-harness)** 的 **git submodule**，路径 `vendor/wow-harness`，跟踪分支 **`feat/opencode-poc`**（接入时最新；含 Cursor 侧 project bridge 等实验能力）。
+远程仓库 **不包含** `wow-harness` 上游代码；根目录 **`.wow-harness/`** 内仅提交 **MANIFEST 等治理锚点**（与主站 Obsidian 对齐），**运行时 `state/` 等由 `.gitignore` 排除**，不进入 Git。
 
-- 仓库根目录 **`.wow-harness`** 为符号链接 → `vendor/wow-harness/.wow-harness`（运行时清单与 `state/` 约定见上游文档）。
-- 更新子模块到远程该分支最新：`git submodule update --remote vendor/wow-harness`
-- 固定到某次提交：进入 `vendor/wow-harness` 后 `git checkout <sha>`，再回到主仓提交 submodule 指针。
+- **全局 Hooks**：在本机配置 Cursor / Claude 的全局 hooks（见主站 `plan/runbook.md` 与 `plan/harness-local-vs-git.md`），任意克隆下来的本仓库都会被识别为带 harness 的项目。
+- **可选**：若要在本地对照上游实现或跑安装器，可单独克隆 [wow-harness](https://github.com/PUDAOCHEN031101/wow-harness) 到任意路径（例如 `~/src/wow-harness`）；**勿**将 `vendor/wow-harness/` 提交进本仓库（已在 `.gitignore` 忽略）。
 
-记账脚本 **不依赖** submodule 即可运行；子模块用于与主站 Obsidian / wow 体系对齐的 **harness 治理与模板**。
+记账脚本 **不依赖** wow-harness 仓库即可运行；harness 仅用于与主站 **治理约定**一致。
 
 编辑 `.env`：
 
