@@ -6,7 +6,7 @@
 #
 # See scripts/guard-feedback.py module docstring for full schema.
 
-enabled: false
+enabled: true
 
 # When enabled, point fragments_dir to where your context fragments live.
 # Each fragment is a markdown file that gets injected into Claude's context

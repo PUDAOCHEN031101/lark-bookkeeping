@@ -5,7 +5,8 @@ node_modules/
 .DS_Store
 .claude/
 .entire/
-.cursor/
+.cursor/*
+!.cursor/hooks.json
 
 # wow-harness：与主仓一致，运行时永不提交（MANIFEST 等若放在根目录可提交；state 不行）
 .wow-harness/state/

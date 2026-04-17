@@ -7,6 +7,11 @@
 - `scripts/cursor/wow_cursor_bridge.py` — 将 Claude Code 风格的 hook 输出（`decision` / `hookSpecificOutput` / stderr+exit 2）转换为 Cursor 要求的 stdout JSON
 - `.wow-harness/state/` — Claude / Cursor 共用运行时真相源；旧 `.towow/` 仅作兼容镜像
 
+## 本仓库现状
+
+- **未安装**完整 wow-harness `scripts/hooks/` bundle（Claude 侧使用 **Entire** 自有 hooks）。
+- 根目录 `.cursor/hooks.json` 为**空 hooks 占位**：若你启用了**全局** `~/.wow-agent-hooks` 分发器，可避免其在本目录下去调用**不存在**的 `scripts/cursor/wow_cursor_bridge.py`。若需完整 Cursor×harness，请从 [wow-harness](https://github.com/NatureBlueee/wow-harness) 对仓库执行 `phase2_auto` 安装 bundle。
+
 ## 使用前提
 
 - 工作区需为**受信任**（项目 hooks 才会执行）
