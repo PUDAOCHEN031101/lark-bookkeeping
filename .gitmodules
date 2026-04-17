@@ -1,0 +1,4 @@
+[submodule "vendor/wow-harness"]
+	path = vendor/wow-harness
+	url = https://github.com/PUDAOCHEN031101/wow-harness.git
+	branch = feat/opencode-poc

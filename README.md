@@ -43,10 +43,22 @@
 ### 4) 快速开始
 
 ```bash
-git clone https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
+git clone --recurse-submodules https://github.com/PUDAOCHEN031101/lark-bookkeeping.git
 cd lark-bookkeeping
+# 若已克隆但未拉子模块：
+git submodule update --init --recursive
 cp .env.example .env
 ```
+
+#### wow-harness 子模块（治理 / Cursor·Claude 兼容）
+
+本仓库包含 **[wow-harness](https://github.com/PUDAOCHEN031101/wow-harness)** 的 **git submodule**，路径 `vendor/wow-harness`，跟踪分支 **`feat/opencode-poc`**（接入时最新；含 Cursor 侧 project bridge 等实验能力）。
+
+- 仓库根目录 **`.wow-harness`** 为符号链接 → `vendor/wow-harness/.wow-harness`（运行时清单与 `state/` 约定见上游文档）。
+- 更新子模块到远程该分支最新：`git submodule update --remote vendor/wow-harness`
+- 固定到某次提交：进入 `vendor/wow-harness` 后 `git checkout <sha>`，再回到主仓提交 submodule 指针。
+
+记账脚本 **不依赖** submodule 即可运行；子模块用于与主站 Obsidian / wow 体系对齐的 **harness 治理与模板**。
 
 编辑 `.env`：
 
