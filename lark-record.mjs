@@ -54,6 +54,8 @@ const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE || process.env.LARK_BOOKKEEP
 const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE || process.env.LARK_BOOKKEEPING_ACCOUNT_TABLE || "";
 const IM_CHAT_ID    = process.env.LARK_CHAT_ID || process.env.LARK_RECORD_CHAT_ID || "";
 const SEND_IM       = process.env.LARK_RECORD_SEND_IM !== "0";
+/** 写入流水表「记账人」单选；仅当显式设置时才写入，避免表无此字段时报错 */
+const RECORD_BOOKKEEPER = process.env.LARK_RECORD_BOOKKEEPER || "";
 
 const MODEL_FALLBACK  = "deepseek-ai/DeepSeek-V3";
 
@@ -196,6 +198,7 @@ function buildFields(parsed) {
   const fields = {};
   fields["交易类型"] = parsed["交易类型"];
   fields["金额"] = Number(parsed["金额"]);
+  if (RECORD_BOOKKEEPER) fields["记账人"] = [RECORD_BOOKKEEPER];
   if (parsed["备注"]) fields["备注"] = parsed["备注"];
   fields["日期"] = parsed["日期"] || (() => {
     const d = new Date();
@@ -205,11 +208,21 @@ function buildFields(parsed) {
   if (parsed["收入分类"]) fields["收入分类"] = parsed["收入分类"];
   if (parsed["借贷方向"]) fields["借贷方向"] = parsed["借贷方向"];
   if (parsed["借款人"])   fields["借款人"]   = parsed["借款人"];
-  for (const key of ["账户", "转出账户", "转入账户"]) {
+  const tt = parsed["交易类型"];
+  for (const key of ["账户"]) {
     if (parsed[key]) {
       const rid = resolveAccount(parsed[key]);
       if (rid) fields[key] = [rid];
       else console.warn(`[record] unknown account: ${parsed[key]}`);
+    }
+  }
+  if (tt === "转账") {
+    for (const key of ["转出账户", "转入账户"]) {
+      if (parsed[key]) {
+        const rid = resolveAccount(parsed[key]);
+        if (rid) fields[key] = [rid];
+        else console.warn(`[record] unknown account: ${parsed[key]}`);
+      }
     }
   }
   return fields;

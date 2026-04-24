@@ -5,8 +5,7 @@ node_modules/
 .DS_Store
 .claude/
 .entire/
-.cursor/*
-!.cursor/hooks.json
+.cursor/
 
 # wow-harness：与主仓一致，运行时永不提交（MANIFEST 等若放在根目录可提交；state 不行）
 .wow-harness/state/
@@ -20,3 +19,25 @@ node_modules/
 
 # 可选：本机单独 clone 的 wow-harness 上游，勿提交进本仓库
 vendor/wow-harness/
+
+.wow-harness/
+.towow/
+CLAUDE.md
+schemas/
+scripts/checks/
+scripts/ci/
+scripts/context-fragments/
+scripts/context_router.py
+scripts/deploy-guard.py
+scripts/guard-feedback.py
+scripts/guard_router.py
+scripts/hooks/
+scripts/install/
+scripts/sanitize.py
+scripts/sync-from-upstream.sh
+scripts/lib/claim_patterns.py
+scripts/lib/sanitize_patterns.py
+scripts/__pycache__/
+scripts/lib/__pycache__/
+plan/plan.md
+plan/do.md
