@@ -28,7 +28,7 @@
 
 建议先复用作者长期在用的 FIRE 账本模板，再按需改字段：
 
-- 模板入口：<https://ks2ynpxs58.feishu.cn/base/EyQJblriPa1R46sJYNrcI1gQndd?table=tblsHPal0ZohtEF3&view=vewor4lDIV>
+- 模板入口：<https://ks2ynpxs58.feishu.cn/base/JSQybjj3jat40UsaEdvcpbJ1n6b>
 - 最少保证两张表：`收支明细` + `账户`
 
 ## 快速开始

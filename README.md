@@ -28,7 +28,7 @@
 
 For first-time users, start from the author's FIRE template and adapt field names as needed:
 
-- Template Base: <https://ks2ynpxs58.feishu.cn/base/EyQJblriPa1R46sJYNrcI1gQndd?table=tblsHPal0ZohtEF3&view=vewor4lDIV>
+- Template Base: <https://ks2ynpxs58.feishu.cn/base/JSQybjj3jat40UsaEdvcpbJ1n6b>
 - Keep at least two tables: `ledger` and `account`
 
 ## Quick Start
