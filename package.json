@@ -7,7 +7,8 @@
     "setup": "node scripts/setup.mjs",
     "doctor": "node scripts/doctor.mjs",
     "start": "node lark-bookkeeping-daemon.mjs",
-    "record": "node lark-record.mjs"
+    "record": "node lark-record.mjs",
+    "admin:replace-account": "node scripts/admin/replace-linked-account.mjs"
   },
   "engines": {
     "node": ">=18"

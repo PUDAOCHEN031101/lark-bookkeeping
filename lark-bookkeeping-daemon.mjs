@@ -55,6 +55,10 @@ const POLL_MS       = Number(process.env.LARK_POLL_MS) || 8_000;
 const POLL_BACKFILL_SECONDS = Number(process.env.LARK_POLL_BACKFILL_SECONDS) || 86_400;
 const EVENT_MODE    = (process.env.LARK_EVENT_MODE || "long").toLowerCase(); // long|webhook|poll
 const LONG_RESTART_MS = Number(process.env.LARK_LONG_RESTART_MS) || 3_000;
+const LONG_WATCHDOG_MS = Number(process.env.LARK_LONG_WATCHDOG_MS) || 300_000;
+const LONG_ERROR_RECONNECT_MS = Number(process.env.LARK_LONG_ERROR_RECONNECT_MS) || 30_000;
+const CATCHUP_POLL_INTERVAL_MS = Number(process.env.LARK_CATCHUP_POLL_INTERVAL_MS) || 600_000;
+const LARK_CLI_EVENT_SUBSCRIBE_FORCE = process.env.LARK_CLI_EVENT_SUBSCRIBE_FORCE !== "0";
 const WEBHOOK_PORT  = Number(process.env.LARK_WEBHOOK_PORT) || 0;
 const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
 const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
@@ -115,8 +119,11 @@ const ACCOUNT_CREATE_PENDING = new Map();
 const LEDGER_GUARD_TTL_MS = 15 * 60 * 1000;
 /** 设为 0 可关闭归属校验（默认开启） */
 const OWNER_GUARD_ENABLED = process.env.LARK_BOOKKEEPING_OWNER_GUARD !== "0";
+const LEDGER_EXPAND_DETAIL_CAP = Math.max(3, Math.min(50, Number(process.env.LARK_BOOKKEEPING_EXPAND_DETAIL_CAP) || 20));
+const DETAIL_CONTEXT_TTL_MS = Math.max(60_000, Number(process.env.LARK_BOOKKEEPING_DETAIL_CONTEXT_TTL_MS) || 10 * 60_000);
 
 let ACCOUNT_CACHE = { ts: 0, rows: [], fields: [], recIds: [] };
+const DETAIL_CONTEXT = new Map();
 
 /** 记账解析可改 BOOKKEEPING_LLM_CHAT_URL；OCR 仍可用 LARK_OCR_CHAT_URL 指硅基 */
 const SILICONFLOW_API = "https://api.siliconflow.cn/v1/chat/completions";
@@ -223,16 +230,42 @@ function loadAccounts() {
 
 // ─── State persistence ────────────────────────────────────────────────────────
 
+function freshState() {
+  return {
+    processedIds: [],
+    processedEventIds: [],
+    lastPollTime: null,
+    lastHandledId: "",
+    observedChatIds: [],
+    lastLongCatchupByChat: {},
+    lastLongCatchupTime: null,
+    longConnAwaitingRecover: false,
+    lastLongDisconnectAt: "",
+    lastLongRecoverAt: "",
+  };
+}
+
+function normalizeState(s) {
+  const state = s && typeof s === "object" ? s : freshState();
+  if (!Array.isArray(state.processedIds)) state.processedIds = [];
+  if (!Array.isArray(state.processedEventIds)) state.processedEventIds = [];
+  if (!Array.isArray(state.observedChatIds)) state.observedChatIds = [];
+  if (!state.lastLongCatchupByChat || typeof state.lastLongCatchupByChat !== "object") state.lastLongCatchupByChat = {};
+  if (!Object.prototype.hasOwnProperty.call(state, "lastPollTime")) state.lastPollTime = null;
+  if (!Object.prototype.hasOwnProperty.call(state, "lastHandledId")) state.lastHandledId = "";
+  if (!Object.prototype.hasOwnProperty.call(state, "lastLongCatchupTime")) state.lastLongCatchupTime = null;
+  if (!Object.prototype.hasOwnProperty.call(state, "longConnAwaitingRecover")) state.longConnAwaitingRecover = false;
+  if (!Object.prototype.hasOwnProperty.call(state, "lastLongDisconnectAt")) state.lastLongDisconnectAt = "";
+  if (!Object.prototype.hasOwnProperty.call(state, "lastLongRecoverAt")) state.lastLongRecoverAt = "";
+  return state;
+}
+
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { processedIds: [], processedEventIds: [], lastPollTime: null, lastHandledId: "" };
+  if (!existsSync(STATE_FILE)) return freshState();
   try {
-    const s = JSON.parse(readFileSync(STATE_FILE, "utf8"));
-    if (!Array.isArray(s.processedIds)) s.processedIds = [];
-    if (!Array.isArray(s.processedEventIds)) s.processedEventIds = [];
-    if (!Object.prototype.hasOwnProperty.call(s, "lastHandledId")) s.lastHandledId = "";
-    return s;
+    return normalizeState(JSON.parse(readFileSync(STATE_FILE, "utf8")));
   } catch {
-    return { processedIds: [], processedEventIds: [], lastPollTime: null, lastHandledId: "" };
+    return freshState();
   }
 }
 
@@ -256,6 +289,15 @@ function persistState() {
   STATE.processedIds = [...PROCESSED_IDS];
   STATE.processedEventIds = [...PROCESSED_EVENT_IDS];
   saveState(STATE);
+}
+
+function observeChatId(chatId) {
+  const id = String(chatId || "").trim();
+  if (!id) return;
+  if (!STATE.observedChatIds.includes(id)) {
+    STATE.observedChatIds.push(id);
+    if (STATE.observedChatIds.length > 50) STATE.observedChatIds = STATE.observedChatIds.slice(-50);
+  }
 }
 
 // ─── lark-cli helper ──────────────────────────────────────────────────────────
@@ -884,6 +926,257 @@ function summarizeRecentRecords(limit = 5) {
   return lines.join("\n");
 }
 
+function listAllLedgerRecords(maxRows = 3000, pageSize = 500) {
+  const rows = [];
+  let fields = [];
+  let offset = 0;
+  const safePageSize = Math.max(20, Math.min(500, Number(pageSize) || 200));
+  while (rows.length < maxRows) {
+    const r = lark([
+      "base", "+record-list",
+      "--base-token", APP_TOKEN,
+      "--table-id", LEDGER_TABLE,
+      "--limit", String(Math.min(safePageSize, maxRows - rows.length)),
+      "--offset", String(offset),
+    ], 45_000);
+    const data = r.data || {};
+    if (!fields.length) fields = data.fields || [];
+    const batch = data.data || [];
+    rows.push(...batch);
+    if (!data.has_more || !batch.length) break;
+    offset += batch.length;
+  }
+  return { rows, fields };
+}
+
+function selectText(value) {
+  if (Array.isArray(value)) return String(value[0] || "");
+  return String(value || "");
+}
+
+function filterLedgerRowsByBookkeeper(rows, fields, bookkeeper = "") {
+  const who = String(bookkeeper || "").trim();
+  const idx = fields.indexOf("记账人");
+  if (!who || idx < 0) return rows;
+  const hasAnyBookkeeper = rows.some((row) => selectText(row[idx]));
+  if (!hasAnyBookkeeper) return rows;
+  return rows.filter((row) => selectText(row[idx]) === who);
+}
+
+function parseRecordDate(raw) {
+  if (!raw) return null;
+  if (raw instanceof Date) return Number.isNaN(raw.getTime()) ? null : raw;
+  if (typeof raw === "number") {
+    const ms = raw < 1e12 ? raw * 1000 : raw;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const text = String(raw).trim();
+  if (!text) return null;
+  let d = new Date(text.includes("T") ? text : text.replace(" ", "T"));
+  if (!Number.isNaN(d.getTime())) return d;
+  const m = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (m) {
+    d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function toDateOnlyString(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function formatDisplayDate(raw, parsedDate = null) {
+  const s = String(raw || "").trim();
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  if (parsedDate && !Number.isNaN(parsedDate.getTime())) return toDateOnlyString(parsedDate);
+  return s || "-";
+}
+
+function getPeriodBounds(label) {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrowStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  if (label === "今天") return { label, start: todayStart, end: tomorrowStart };
+  if (label === "昨天") {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    return { label, start, end: todayStart };
+  }
+  if (label === "本周") {
+    const day = todayStart.getDay();
+    const diffToMonday = day === 0 ? -6 : 1 - day;
+    const start = new Date(todayStart);
+    start.setDate(todayStart.getDate() + diffToMonday);
+    return { label, start, end: tomorrowStart };
+  }
+  if (label === "本月") {
+    return { label, start: new Date(now.getFullYear(), now.getMonth(), 1), end: tomorrowStart };
+  }
+  if (label === "上月") {
+    return { label, start: new Date(now.getFullYear(), now.getMonth() - 1, 1), end: new Date(now.getFullYear(), now.getMonth(), 1) };
+  }
+  return null;
+}
+
+function parsePeriodExpression(text, suffixPattern) {
+  const t = String(text || "").trim().replace(/的/g, "");
+  const named = [
+    ["今天", /^(查|查询)?(今天|今日)/],
+    ["昨天", /^(查|查询)?(昨天|昨日)/],
+    ["本周", /^(查|查询)?(本周|这周|这一周)/],
+    ["本月", /^(查|查询)?(本月|这个月)/],
+    ["上月", /^(查|查询)?(上月|上个月)/],
+  ];
+  for (const [label, prefix] of named) {
+    if (prefix.test(t) && suffixPattern.test(t)) return getPeriodBounds(label);
+  }
+
+  let m = t.match(/^(查|查询)?\s*(\d{4}-\d{2}-\d{2})\s*(.+)$/);
+  if (m && suffixPattern.test(m[3])) {
+    const start = new Date(`${m[2]}T00:00:00`);
+    if (!Number.isNaN(start.getTime())) {
+      const end = new Date(start);
+      end.setDate(end.getDate() + 1);
+      return { label: m[2], start, end };
+    }
+  }
+
+  m = t.match(/^(查|查询)?\s*(\d{4}-\d{2})\s*(.+)$/);
+  if (m && suffixPattern.test(m[3])) {
+    const [y, mo] = m[2].split("-").map(Number);
+    if (y && mo >= 1 && mo <= 12) {
+      return { label: m[2], start: new Date(y, mo - 1, 1), end: new Date(y, mo, 1) };
+    }
+  }
+  return null;
+}
+
+function getSpendPeriod(text) {
+  return parsePeriodExpression(text, /(花了多少|支出|花费)$/);
+}
+
+function getIncomeExpensePeriod(text) {
+  return parsePeriodExpression(text, /(收支明细|收支)$/);
+}
+
+function ledgerRowsForPeriod(period, bookkeeper = "") {
+  const { rows: allRows, fields } = listAllLedgerRecords(3000, 500);
+  const rows = filterLedgerRowsByBookkeeper(allRows, fields, bookkeeper);
+  const idxType = fields.indexOf("交易类型");
+  const idxAmount = fields.indexOf("金额");
+  const idxNote = fields.indexOf("备注");
+  const idxDate = fields.indexOf("日期");
+  if (idxType < 0 || idxAmount < 0 || idxDate < 0) {
+    throw new Error("账本字段缺失：交易类型/金额/日期");
+  }
+  return rows
+    .map((row) => {
+      const type = String(row[idxType] || "");
+      const amount = Number(row[idxAmount] || 0);
+      const note = idxNote >= 0 ? String(row[idxNote] || "") : "";
+      const dateRaw = String(row[idxDate] || "");
+      const date = parseRecordDate(dateRaw);
+      return { type, amount, note, dateRaw, date };
+    })
+    .filter((x) => (x.type === "支出" || x.type === "收入") && x.amount > 0 && x.date)
+    .filter((x) => x.date >= period.start && x.date < period.end)
+    .sort((a, b) => b.date - a.date);
+}
+
+function summarizeSpendOverviewByPeriod(period, bookkeeper = "") {
+  const rows = ledgerRowsForPeriod(period, bookkeeper).filter((x) => x.type === "支出");
+  const total = rows.reduce((acc, x) => acc + x.amount, 0);
+  const who = bookkeeper ? `（${bookkeeper}）` : "";
+  return [
+    `${period.label} 支出概览${who}`,
+    `总计: ¥${total.toFixed(2)}（${rows.length} 笔）`,
+    "",
+    "如需明细请发：展开明细",
+  ].join("\n");
+}
+
+function summarizeSpendDetailByPeriod(period, bookkeeper = "") {
+  const rows = ledgerRowsForPeriod(period, bookkeeper).filter((x) => x.type === "支出");
+  if (!rows.length) return `${period.label} 暂无支出记录${bookkeeper ? `（${bookkeeper}）` : ""}。`;
+  const total = rows.reduce((acc, x) => acc + x.amount, 0);
+  const lines = [
+    `${period.label} 支出明细${bookkeeper ? `（${bookkeeper}）` : ""}`,
+    `总计: ¥${total.toFixed(2)}（${rows.length} 笔）`,
+    "",
+  ];
+  for (const x of rows.slice(0, LEDGER_EXPAND_DETAIL_CAP)) {
+    lines.push(`- ¥${x.amount.toFixed(2)} | ${x.note || "-"} | ${formatDisplayDate(x.dateRaw, x.date)}`);
+  }
+  if (rows.length > LEDGER_EXPAND_DETAIL_CAP) lines.push(`... 尚有 ${rows.length - LEDGER_EXPAND_DETAIL_CAP} 笔未列出`);
+  return lines.join("\n");
+}
+
+function summarizeIncomeExpenseOverviewByPeriod(period, bookkeeper = "") {
+  const rows = ledgerRowsForPeriod(period, bookkeeper);
+  const spendRows = rows.filter((x) => x.type === "支出");
+  const incomeRows = rows.filter((x) => x.type === "收入");
+  const spend = spendRows.reduce((acc, x) => acc + x.amount, 0);
+  const income = incomeRows.reduce((acc, x) => acc + x.amount, 0);
+  const who = bookkeeper ? `（${bookkeeper}）` : "";
+  return [
+    `${period.label} 收支概览${who}`,
+    `收入: ¥${income.toFixed(2)}（${incomeRows.length} 笔）`,
+    `支出: ¥${spend.toFixed(2)}（${spendRows.length} 笔）`,
+    `净额: ¥${(income - spend).toFixed(2)}`,
+    "",
+    "如需明细请发：展开明细",
+  ].join("\n");
+}
+
+function summarizeIncomeExpenseDetailByPeriod(period, bookkeeper = "") {
+  const rows = ledgerRowsForPeriod(period, bookkeeper);
+  const spendRows = rows.filter((x) => x.type === "支出");
+  const incomeRows = rows.filter((x) => x.type === "收入");
+  const spend = spendRows.reduce((acc, x) => acc + x.amount, 0);
+  const income = incomeRows.reduce((acc, x) => acc + x.amount, 0);
+  const lines = [
+    `${period.label} 收支明细${bookkeeper ? `（${bookkeeper}）` : ""}`,
+    `收入: ¥${income.toFixed(2)}（${incomeRows.length} 笔）`,
+    `支出: ¥${spend.toFixed(2)}（${spendRows.length} 笔）`,
+    `净额: ¥${(income - spend).toFixed(2)}`,
+  ];
+  lines.push("", "收入明细：");
+  if (incomeRows.length) {
+    for (const x of incomeRows.slice(0, LEDGER_EXPAND_DETAIL_CAP)) {
+      lines.push(`- ¥${x.amount.toFixed(2)} | ${x.note || "-"} | ${formatDisplayDate(x.dateRaw, x.date)}`);
+    }
+    if (incomeRows.length > LEDGER_EXPAND_DETAIL_CAP) lines.push(`... 尚有 ${incomeRows.length - LEDGER_EXPAND_DETAIL_CAP} 笔收入未列出`);
+  } else {
+    lines.push("暂无");
+  }
+  lines.push("", "支出明细：");
+  if (spendRows.length) {
+    for (const x of spendRows.slice(0, LEDGER_EXPAND_DETAIL_CAP)) {
+      lines.push(`- ¥${x.amount.toFixed(2)} | ${x.note || "-"} | ${formatDisplayDate(x.dateRaw, x.date)}`);
+    }
+    if (spendRows.length > LEDGER_EXPAND_DETAIL_CAP) lines.push(`... 尚有 ${spendRows.length - LEDGER_EXPAND_DETAIL_CAP} 笔支出未列出`);
+  } else {
+    lines.push("暂无");
+  }
+  return lines.join("\n");
+}
+
+function setDetailContext(key, ctx) {
+  DETAIL_CONTEXT.set(key, { ...ctx, ts: Date.now() });
+}
+
+function getDetailContext(key) {
+  const ctx = DETAIL_CONTEXT.get(key);
+  if (!ctx) return null;
+  if (Date.now() - ctx.ts > DETAIL_CONTEXT_TTL_MS) {
+    DETAIL_CONTEXT.delete(key);
+    return null;
+  }
+  return ctx;
+}
+
 function readRecentJsonLines(file, limit = 5) {
   if (!existsSync(file)) return [];
   try {
@@ -925,6 +1218,13 @@ function parseControlCommand(text) {
   const t = text.trim();
   if (/^(查余额|余额|balance)$/i.test(t)) return { action: "balance" };
   if (/^(本月汇总|月报)$/i.test(t)) return { action: "monthly" };
+  if (/^(展开明细|查明细|明细)$/i.test(t)) return { action: "expand_details" };
+
+  const spendPeriod = getSpendPeriod(t);
+  if (spendPeriod) return { action: "spend_overview", period: spendPeriod };
+
+  const incomeExpensePeriod = getIncomeExpensePeriod(t);
+  if (incomeExpensePeriod) return { action: "income_expense_detail", period: incomeExpensePeriod };
 
   const listMatch = t.match(/^(查最近|最近)\s*(\d+)?\s*笔?$/);
   if (listMatch) return { action: "list", limit: Number(listMatch[2] || 5) };
@@ -1127,17 +1427,74 @@ async function runDeepSeekOcr(imageUrlOrDataUrl) {
 
 // ─── Message polling ──────────────────────────────────────────────────────────
 
-function fetchNewMessages(since) {
+function chatIdsForFetch() {
+  const ids = new Set();
+  for (const id of ALLOWED_CHAT_IDS) ids.add(id);
+  if (CHAT_ID) ids.add(CHAT_ID);
+  for (const id of STATE.observedChatIds || []) ids.add(id);
+  return [...ids].filter(Boolean);
+}
+
+function getCatchupResumeSinceForChat(chatId) {
+  const backfillMs = Math.max(0, POLL_BACKFILL_SECONDS) * 1000;
+  const floorSince = new Date(Date.now() - backfillMs).toISOString();
+  const map = STATE.lastLongCatchupByChat;
+  const perChat = map && typeof map === "object" ? map[chatId] : "";
+  let resume = perChat || floorSince;
+  if (resume < floorSince) resume = floorSince;
+  return resume;
+}
+
+function catchupWatermarkIsoFromMsg(msg) {
+  const raw = msg?.create_time ?? msg?.create_time_ms ?? msg?.updated_at ?? msg?.update_time ?? "";
+  if (raw === "" || raw == null) return new Date().toISOString();
+  const n = Number(raw);
+  if (!Number.isNaN(n) && n > 0) {
+    const ms = n < 1e12 ? n * 1000 : n;
+    return new Date(ms).toISOString();
+  }
+  const d = new Date(String(raw));
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
+function bumpLongCatchupWatermark(msg) {
+  try {
+    const chatId = msg?.chat_id || CHAT_ID || "";
+    if (!chatId) return;
+    observeChatId(chatId);
+    const iso = catchupWatermarkIsoFromMsg(msg);
+    if (!STATE.lastLongCatchupByChat || typeof STATE.lastLongCatchupByChat !== "object") {
+      STATE.lastLongCatchupByChat = {};
+    }
+    const prev = STATE.lastLongCatchupByChat[chatId] || "";
+    if (!prev || iso > prev) STATE.lastLongCatchupByChat[chatId] = iso;
+    if (!STATE.lastLongCatchupTime || iso > STATE.lastLongCatchupTime) STATE.lastLongCatchupTime = iso;
+  } catch {
+    // ignore watermark failures
+  }
+}
+
+function fetchChatMessagesOnePage({ since, chatId, pageToken = "" }) {
   const args = [
     "im", "+chat-messages-list",
-    "--chat-id", CHAT_ID,
+    "--as", "bot",
+    "--chat-id", chatId,
     "--sort", "asc",
-    "--page-size", "20",
+    "--page-size", "50",
   ];
-  if (since) args.push("--start", since);
+  if (pageToken) args.push("--page-token", pageToken);
+  else if (since) args.push("--start", since);
   const r = lark(args, 25_000);
-  // lark-cli returns data.messages (not data.items)
-  return r?.data?.messages || [];
+  const data = r?.data || {};
+  return {
+    messages: data.messages || [],
+    nextPageToken: data.page_token || data.pageToken || data.next_page_token || "",
+  };
+}
+
+function fetchNewMessages(since, chatId) {
+  if (!chatId) return [];
+  return fetchChatMessagesOnePage({ since, chatId }).messages;
 }
 
 function extractText(msg) {
@@ -1151,6 +1508,83 @@ function extractText(msg) {
     } catch { /* fall through */ }
   }
   return String(raw).trim();
+}
+
+function isSelfGeneratedBookkeepingNotice(text) {
+  const t = String(text || "").trim();
+  return (
+    t.startsWith("✅ 已记账") ||
+    t.startsWith("❌ 记账失败") ||
+    t.startsWith("🤖 记账机器人") ||
+    t.startsWith("账户余额：") ||
+    t.startsWith("⚠️ 记账人") ||
+    t.startsWith("⚠️ 记账机器人") ||
+    t.startsWith("本轮补拉") ||
+    t.startsWith("长连接已断开") ||
+    t.startsWith("今天 支出") ||
+    t.startsWith("昨天 支出") ||
+    t.startsWith("本周 支出") ||
+    t.startsWith("本月 支出") ||
+    t.startsWith("上月 支出") ||
+    t.startsWith("今天 收支") ||
+    t.startsWith("昨天 收支") ||
+    t.startsWith("本周 收支") ||
+    t.startsWith("本月 收支") ||
+    t.startsWith("上月 收支") ||
+    t.startsWith("今天支出") ||
+    t.startsWith("本周支出") ||
+    t.startsWith("本月支出") ||
+    t.startsWith("今天收支") ||
+    t.startsWith("本周收支") ||
+    t.startsWith("本月收支")
+  );
+}
+
+async function backfillMissedMessagesBeforeLongSubscribe(reason) {
+  const chatIds = chatIdsForFetch();
+  if (!chatIds.length) {
+    log(`[backfill] skip (${reason}): no chat ids yet`);
+    return;
+  }
+
+  log(`[backfill] ${reason} chats=${chatIds.join(",")}`);
+  const nowIso = new Date().toISOString();
+  let replayed = 0;
+
+  for (const chatId of chatIds) {
+    const resumeSince = getCatchupResumeSinceForChat(chatId);
+    let pageToken = "";
+    for (let page = 0; page < 100; page++) {
+      let batch;
+      try {
+        batch = fetchChatMessagesOnePage({ since: pageToken ? "" : resumeSince, chatId, pageToken });
+      } catch (e) {
+        log(`[backfill] chat=${chatId} page=${page + 1} error: ${e.message}`);
+        break;
+      }
+      const { messages, nextPageToken } = batch;
+      if (!messages.length && !nextPageToken) break;
+      for (const msg of messages) {
+        try {
+          await handleIncomingMessage(msg, "");
+        } catch (e) {
+          log(`[backfill] handle msg=${msg?.message_id || msg?.id}: ${e.message}`);
+        }
+        replayed++;
+      }
+      if (!nextPageToken) break;
+      pageToken = nextPageToken;
+    }
+    STATE.lastLongCatchupByChat[chatId] = nowIso;
+  }
+
+  STATE.lastLongCatchupTime = nowIso;
+  if (STATE.longConnAwaitingRecover) {
+    STATE.longConnAwaitingRecover = false;
+    STATE.lastLongRecoverAt = nowIso;
+  }
+  persistState();
+  log(`[backfill] ${reason} done, touched≈${replayed} message(s)`);
 }
 
 // ─── Process a single message ─────────────────────────────────────────────────
@@ -1339,6 +1773,28 @@ async function processMessage(msg) {
         sendIM("月度汇总请用命令行: node scripts/lark-record.mjs --monthly", replyChatId, replyToMessageId);
         return;
       }
+      if (cmd.action === "spend_overview") {
+        setDetailContext(guardKey, { kind: "spend", period: cmd.period, bookkeeper });
+        sendIM(summarizeSpendOverviewByPeriod(cmd.period, bookkeeper), replyChatId, replyToMessageId);
+        return;
+      }
+      if (cmd.action === "income_expense_detail") {
+        setDetailContext(guardKey, { kind: "income_expense", period: cmd.period, bookkeeper });
+        sendIM(summarizeIncomeExpenseDetailByPeriod(cmd.period, bookkeeper), replyChatId, replyToMessageId);
+        return;
+      }
+      if (cmd.action === "expand_details") {
+        const ctx = getDetailContext(guardKey);
+        if (!ctx) {
+          sendIM("还没有可展开的查询结果。先发：今天花了多少 / 本周收支明细 / 本月花了多少。", replyChatId, replyToMessageId);
+          return;
+        }
+        const msg = ctx.kind === "spend"
+          ? summarizeSpendDetailByPeriod(ctx.period, ctx.bookkeeper)
+          : summarizeIncomeExpenseDetailByPeriod(ctx.period, ctx.bookkeeper);
+        sendIM(msg, replyChatId, replyToMessageId);
+        return;
+      }
       if (cmd.action === "list") {
         sendIM(summarizeRecentRecords(cmd.limit), replyChatId, replyToMessageId);
         return;
@@ -1472,7 +1928,7 @@ async function processMessage(msg) {
           );
         } else if (/(帮助|help|怎么用|指令)/i.test(text)) {
           sendIM(
-            `🤖 记账机器人在线\n发记账消息：晚餐68微信 / 工资8000招行 / 借给小明500\n可一次发多笔（多行或一句话里多笔）\n发"查余额"查账户余额`,
+            `🤖 记账机器人在线\n发记账消息：晚餐68微信 / 晚餐，68，微信 / 余额宝转招行500\n查询：查余额 / 查最近5笔 / 今天花了多少 / 本周收支明细\n可一次发多笔（多行或一句话里多笔）`,
             replyChatId,
             replyToMessageId
           );
@@ -1632,9 +2088,17 @@ async function handleWebhookEvent(payload) {
     return;
   }
   if (PROCESSED_IDS.has(msgId)) return;
+  if (isSelfGeneratedBookkeepingNotice(normalizeBookkeepingLine(extractText(msg)))) {
+    if (eventId) PROCESSED_EVENT_IDS.add(eventId);
+    PROCESSED_IDS.add(msgId);
+    bumpLongCatchupWatermark(msg);
+    persistState();
+    return;
+  }
 
   if (eventId) PROCESSED_EVENT_IDS.add(eventId);
   PROCESSED_IDS.add(msgId);
+  bumpLongCatchupWatermark(msg);
   STATE.lastHandledId = msgId;
   persistState();
 
@@ -1718,9 +2182,17 @@ async function handleIncomingMessage(msg, eventId = "") {
   if (ALLOWED_CHAT_IDS.size > 0 && msg.chat_id && !ALLOWED_CHAT_IDS.has(msg.chat_id)) return;
   if (msg.message_type && msg.message_type !== "text" && msg.message_type !== "image") return;
   if (PROCESSED_IDS.has(msgId)) return;
+  if (isSelfGeneratedBookkeepingNotice(normalizeBookkeepingLine(extractText(msg)))) {
+    if (eventId) PROCESSED_EVENT_IDS.add(eventId);
+    PROCESSED_IDS.add(msgId);
+    bumpLongCatchupWatermark(msg);
+    persistState();
+    return;
+  }
 
   if (eventId) PROCESSED_EVENT_IDS.add(eventId);
   PROCESSED_IDS.add(msgId);
+  bumpLongCatchupWatermark(msg);
   STATE.lastHandledId = msgId;
   persistState();
   await processMessage(msg);
@@ -1728,6 +2200,11 @@ async function handleIncomingMessage(msg, eventId = "") {
 
 async function startLongConnectionLoop() {
   while (true) {
+    try {
+      await backfillMissedMessagesBeforeLongSubscribe("before_long_subscribe");
+    } catch (e) {
+      log(`[backfill] fatal (continuing to subscribe): ${e.message}`);
+    }
     log(`Long-connection subscribe started via ${getLarkCliBin()}`);
     await new Promise((resolve) => {
       const args = [
@@ -1736,12 +2213,21 @@ async function startLongConnectionLoop() {
         "--event-types", "im.message.receive_v1",
         "--quiet",
       ];
+      if (LARK_CLI_EVENT_SUBSCRIBE_FORCE) args.push("--force");
       const child = spawnLarkCli(args, {
         cwd: process.cwd(),
         stdio: ["ignore", "pipe", "pipe"],
       });
 
       let buffer = "";
+      let suspectSince = 0;
+      const watchdog = setInterval(() => {
+        if (!suspectSince) return;
+        if (Date.now() - suspectSince < Math.min(LONG_WATCHDOG_MS, LONG_ERROR_RECONNECT_MS)) return;
+        log("[long-conn] watchdog: subscribe reported a connection error but did not exit; killing to reconnect");
+        clearInterval(watchdog);
+        try { child.kill("SIGTERM"); } catch {}
+      }, 5_000);
       child.stdout.on("data", (chunk) => {
         buffer += chunk.toString();
         let idx = buffer.indexOf("\n");
@@ -1749,6 +2235,7 @@ async function startLongConnectionLoop() {
           const line = buffer.slice(0, idx).trim();
           buffer = buffer.slice(idx + 1);
           if (line) {
+            suspectSince = 0;
             try {
               const payload = JSON.parse(line);
               const eventId = payload?.header?.event_id || payload?.event_id || "";
@@ -1766,19 +2253,42 @@ async function startLongConnectionLoop() {
 
       child.stderr.on("data", (chunk) => {
         const text = chunk.toString().trim();
-        if (text) log(`[long-conn] ${text}`);
+        if (text) {
+          log(`[long-conn] ${text}`);
+          if (/websocket|disconnect|disconnected|closed|close|timeout|eof|error|failed/i.test(text)) {
+            suspectSince ||= Date.now();
+          }
+        }
       });
       child.on("exit", (code, signal) => {
+        clearInterval(watchdog);
         log(`Long-connection exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+        STATE.longConnAwaitingRecover = true;
+        STATE.lastLongDisconnectAt = new Date().toISOString();
+        persistState();
         resolve();
       });
       child.on("error", (e) => {
+        clearInterval(watchdog);
         log(`Long-connection spawn error: ${e.message}.${larkCliWindowsHint()}`);
         resolve();
       });
     });
     await new Promise(r => setTimeout(r, LONG_RESTART_MS));
   }
+}
+
+function startCatchupPollInterval() {
+  if (!CATCHUP_POLL_INTERVAL_MS || EVENT_MODE === "poll") return;
+  const interval = Math.max(60_000, CATCHUP_POLL_INTERVAL_MS);
+  log(`[catchup-poll] interval=${Math.round(interval / 1000)}s`);
+  setInterval(async () => {
+    try {
+      await backfillMissedMessagesBeforeLongSubscribe("catchup_poll");
+    } catch (e) {
+      log(`[catchup-poll] error: ${e.message}`);
+    }
+  }, interval);
 }
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
@@ -1799,23 +2309,28 @@ async function pollLoop() {
 
   while (true) {
     try {
-      const msgs = fetchNewMessages(lastPollTime);
       const now = new Date().toISOString();
+      const chatIds = chatIdsForFetch();
+      if (!chatIds.length) throw new Error("poll mode: no chat id configured");
 
-      for (const msg of msgs) {
-        const msgId = msg.message_id || msg.id;
-        if (!msgId) continue;
-        if (PROCESSED_IDS.has(msgId)) continue;
+      for (const chatId of chatIds) {
+        const msgs = fetchNewMessages(lastPollTime, chatId);
+        for (const msg of msgs) {
+          const msgId = msg.message_id || msg.id;
+          if (!msgId) continue;
+          if (PROCESSED_IDS.has(msgId)) continue;
 
-        // Skip bot's own messages (sender type "app")
-        if (msg.sender?.sender_type === "app") {
+          if (msg.sender?.sender_type === "app") {
+            PROCESSED_IDS.add(msgId);
+            bumpLongCatchupWatermark(msg);
+            continue;
+          }
+
           PROCESSED_IDS.add(msgId);
-          continue;
+          bumpLongCatchupWatermark(msg);
+          await processMessage(msg);
+          STATE.lastHandledId = msgId;
         }
-
-        PROCESSED_IDS.add(msgId);
-        await processMessage(msg);
-        STATE.lastHandledId = msgId;
       }
 
       lastPollTime = now;
@@ -1835,8 +2350,8 @@ async function main() {
       "missing required env: LARK_APP_TOKEN/LARK_LEDGER_TABLE/LARK_ACCOUNT_TABLE (or LARK_BOOKKEEPING_* aliases)"
     );
   }
-  if (EVENT_MODE === "poll" && !CHAT_ID) {
-    throw new Error("missing required env: LARK_CHAT_ID (polling mode only). Use LARK_EVENT_MODE=long for bot auto-reply without a fixed chat ID.");
+  if (EVENT_MODE === "poll" && !chatIdsForFetch().length) {
+    throw new Error("missing required env: LARK_CHAT_ID or LARK_BOOKKEEPING_CHAT_IDS (polling mode only). Use LARK_EVENT_MODE=long for bot auto-reply without a fixed chat ID.");
   }
   if (!getLlmApiKey()) {
     log("LLM key not set. Local shortcut formats still work, e.g. 晚餐，68，微信 / 余额宝转招行500; natural-language parsing requires SILICONFLOW_API_KEY, OPENAI_API_KEY, or LLM_API_KEY.");
@@ -1849,6 +2364,7 @@ async function main() {
   if (EVENT_MODE === "long") {
     log("Mode: long-connection");
     log("Long mode listens to bot message events and replies to the source chat. No LARK_CHAT_ID is required unless you want a chat allowlist.");
+    startCatchupPollInterval();
     await startLongConnectionLoop();
     return;
   }
@@ -1856,7 +2372,13 @@ async function main() {
   if (EVENT_MODE === "webhook") {
     if (WEBHOOK_PORT <= 0) throw new Error("missing required env: LARK_WEBHOOK_PORT (webhook mode)");
     log("Mode: webhook");
+    try {
+      await backfillMissedMessagesBeforeLongSubscribe("webhook_startup");
+    } catch (e) {
+      log(`[backfill] webhook_startup error: ${e.message}`);
+    }
     startWebhookServer();
+    startCatchupPollInterval();
     return;
   }
 

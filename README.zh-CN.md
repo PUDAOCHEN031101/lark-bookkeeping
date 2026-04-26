@@ -14,9 +14,11 @@
 - 群聊/单聊直接发消息记账：`晚餐68微信`、`工资8000招行`、`微信转招行1000`
 - 常用快捷格式本地解析、无需等待 AI：`晚餐，68，微信`、`余额宝转招行500`
 - 查询：`查余额`、`查最近5笔`
+- 周期查询：`今天花了多少`、`本周收支明细`、`本月花了多少`，概览后可发 `展开明细`
 - 删除：`删除上一笔`、`删除 recxxxx`
 - 修改：`修改 recxxxx 金额=88 备注=午饭 分类=食 账户=微信`
 - 支持三种接入模式：默认机器人自动响应（无需群 ID）、8 秒轮询，或 Webhook 实时回调
+- long/webhook 模式内置断线重连、`--force` 订阅、历史水位和定时补拉；无群 ID 时自动跳过补拉，有白名单或历史会话后才补拉
 
 ## 数据模型：双表
 
@@ -43,6 +45,8 @@ npm start
 ```
 
 `npm run setup` 会引导你登录飞书、粘贴多维表格 URL、可选填写 LLM Key，并生成 `.env`。默认使用机器人自动响应模式：把机器人拉进群或直接私聊机器人，不需要手动查群 ID。
+
+核心产品路径就是：复制飞书 Base 模板、运行 setup/doctor、启动机器人。账单导入、月度诊断、Obsidian 联动和长期守护部署都属于高级能力，不影响首次跑通。
 
 ### 选择你的 LLM 提供商（默认硅基，可自选）
 
@@ -96,6 +100,15 @@ node lark-record.mjs --monthly 2026-04
 node lark-record.mjs --list 5
 node lark-record.mjs --delete recxxxxxxxx
 node lark-record.mjs --update recxxxxxxxx --set 金额=88,备注=午饭,分类=食
+```
+
+## Admin 工具
+
+修正历史流水的账户关联：
+
+```bash
+npm run admin:replace-account -- --ids recxxx,recyyy --field 账户 --to-name 零钱通 --dry-run
+npm run admin:replace-account -- --from-name 微信零钱 --to-name 零钱通 --field 账户 --dry-run
 ```
 
 ## License
