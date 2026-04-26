@@ -23,13 +23,16 @@
  */
 
 import { spawnSync } from "child_process";
-import { readFileSync, existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import { loadEnvFile } from "./scripts/lib/local-env.mjs";
+import { runLarkCliJson } from "./scripts/lib/lark-cli-local.mjs";
 import {
   BOOKKEEPING_MULTI_INSTRUCTIONS,
   entriesFromAiJson,
 } from "./scripts/lib/bookkeeping-multi.mjs";
+import { parseFastBookkeepingLines } from "./scripts/lib/bookkeeping-comma-triple.mjs";
 import { getLlmApiKey, getLlmChatUrl, parseBookkeepingWithLLM } from "./scripts/lib/bookkeeping-parse-llm.mjs";
 
 // ─── Load .env if present ──────────────────────────────────────────────────────
@@ -37,13 +40,7 @@ import { getLlmApiKey, getLlmChatUrl, parseBookkeepingWithLLM } from "./scripts/
 const __dir = dirname(fileURLToPath(import.meta.url));
 
 function loadEnv() {
-  const envPath = resolve(__dir, ".env");
-  if (!existsSync(envPath)) return;
-  const lines = readFileSync(envPath, "utf8").split("\n");
-  for (const line of lines) {
-    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
-  }
+  loadEnvFile(resolve(__dir, ".env"));
 }
 loadEnv();
 
@@ -54,6 +51,10 @@ const LEDGER_TABLE  = process.env.LARK_LEDGER_TABLE || process.env.LARK_BOOKKEEP
 const ACCOUNT_TABLE = process.env.LARK_ACCOUNT_TABLE || process.env.LARK_BOOKKEEPING_ACCOUNT_TABLE || "";
 const IM_CHAT_ID    = process.env.LARK_CHAT_ID || process.env.LARK_RECORD_CHAT_ID || "";
 const SEND_IM       = process.env.LARK_RECORD_SEND_IM !== "0";
+const REPLY_AS = (() => {
+  const value = (process.env.LARK_REPLY_AS || "auto").toLowerCase();
+  return ["auto", "bot", "user"].includes(value) ? value : "auto";
+})();
 /** 写入流水表「记账人」单选；仅当显式设置时才写入，避免表无此字段时报错 */
 const RECORD_BOOKKEEPER = process.env.LARK_RECORD_BOOKKEEPER || "";
 
@@ -104,22 +105,12 @@ function loadAccounts() {
 }
 
 const ACCOUNTS = loadAccounts();
+let ACCOUNT_TABLE_CACHE = null;
 
 // ─── lark-cli helper ──────────────────────────────────────────────────────────
 
 function lark(args, timeout = 30_000) {
-  const r = spawnSync("lark-cli", args, {
-    encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout,
-    env: { ...process.env },
-  });
-  if (r.error) throw new Error(`lark spawn: ${r.error.message}`);
-  const out = (r.stdout || "").trim();
-  const i = out.indexOf("{");
-  if (i < 0) {
-    const err = (r.stderr || "").trim();
-    throw new Error(`no JSON: ${(err || out).slice(0, 300)}`);
-  }
-  return JSON.parse(out.slice(i));
+  return runLarkCliJson(args, { timeout });
 }
 
 // ─── AI parsing ───────────────────────────────────────────────────────────────
@@ -189,7 +180,35 @@ function resolveAccount(name) {
   for (const [k, v] of Object.entries(ACCOUNTS)) {
     if (name.includes(k) || k.includes(name)) return v;
   }
+  const tableAccounts = loadAccountTableMap();
+  if (tableAccounts[name]) return tableAccounts[name];
+  const pairs = Object.entries(tableAccounts).sort((a, b) => b[0].length - a[0].length);
+  for (const [k, v] of pairs) {
+    if (name.includes(k) || k.includes(name)) return v;
+  }
   return null;
+}
+
+function loadAccountTableMap() {
+  if (ACCOUNT_TABLE_CACHE) return ACCOUNT_TABLE_CACHE;
+  ACCOUNT_TABLE_CACHE = {};
+  if (!APP_TOKEN || !ACCOUNT_TABLE) return ACCOUNT_TABLE_CACHE;
+  try {
+    const r = lark(["base", "+record-list", "--base-token", APP_TOKEN, "--table-id", ACCOUNT_TABLE, "--limit", "200"], 30_000);
+    const fields = r.data?.fields || [];
+    const rows = r.data?.data || [];
+    const ids = r.data?.record_id_list || [];
+    const nameIdx = fields.indexOf("账户名称");
+    if (nameIdx < 0) return ACCOUNT_TABLE_CACHE;
+    for (let i = 0; i < rows.length; i++) {
+      const accountName = String(rows[i]?.[nameIdx] || "").trim();
+      const recordId = ids[i];
+      if (accountName && recordId) ACCOUNT_TABLE_CACHE[accountName] = recordId;
+    }
+  } catch (e) {
+    console.warn(`[record] account table lookup failed: ${e.message}`);
+  }
+  return ACCOUNT_TABLE_CACHE;
 }
 
 // ─── Build fields ─────────────────────────────────────────────────────────────
@@ -271,11 +290,20 @@ function deleteRecord(recordId) {
 
 function sendIM(message) {
   if (!IM_CHAT_ID) return;
-  try {
-    lark(["im", "+messages-send", "--as", "user", "--chat-id", IM_CHAT_ID, "--text", message]);
-  } catch (e) {
-    console.warn(`[record] IM send failed (non-fatal): ${e.message}`);
+  const identities = REPLY_AS === "auto" ? ["bot", "user"] : [REPLY_AS];
+  let lastError = null;
+  for (let idx = 0; idx < identities.length; idx++) {
+    const as = identities[idx];
+    const fallbackNote = idx < identities.length - 1 ? ", trying fallback" : "";
+    try {
+      lark(["im", "+messages-send", "--as", as, "--chat-id", IM_CHAT_ID, "--text", message]);
+      return;
+    } catch (e) {
+      lastError = e;
+      console.warn(`[record] IM send as ${as} failed${fallbackNote}: ${e.message}`);
+    }
   }
+  if (lastError) console.warn(`[record] IM send failed (non-fatal): ${lastError.message}`);
 }
 
 function buildConfirmation(parsed) {
@@ -411,11 +439,6 @@ async function main() {
     return;
   }
 
-  if (!APP_TOKEN || !LEDGER_TABLE || !getLlmApiKey()) {
-    console.error("[record] Missing LARK_APP_TOKEN / LARK_LEDGER_TABLE + LLM key（SILICONFLOW_API_KEY / OPENAI_API_KEY / LLM_API_KEY 或 LARK_BOOKKEEPING_* 别名）");
-    process.exit(1);
-  }
-
   const dryRun = args.includes("--dry-run");
   const input  = args.filter(a => !a.startsWith("--")).join(" ").trim();
 
@@ -426,17 +449,32 @@ async function main() {
 
   console.log(`[record] Parsing: "${input}"`);
   let parsed;
+  let entries = parseFastBookkeepingLines(input);
   try {
-    parsed = await parseWithAI(input);
-    console.log("[record] Parsed:", JSON.stringify(parsed, null, 2));
+    if (entries.length) {
+      parsed = entries.length === 1 ? entries[0] : { entries };
+      console.log("[record] Parsed locally:", JSON.stringify(parsed, null, 2));
+    } else {
+      if (!getLlmApiKey()) {
+        console.error("[record] Missing LLM key. Set SILICONFLOW_API_KEY / OPENAI_API_KEY / LLM_API_KEY, or use a local shortcut format like: 晚餐，68，微信");
+        process.exit(1);
+      }
+      parsed = await parseWithAI(input);
+      console.log("[record] Parsed:", JSON.stringify(parsed, null, 2));
+      entries = entriesFromAiJson(parsed);
+    }
   } catch (e) {
     console.error(`[record] Parse failed: ${e.message}`);
     process.exit(1);
   }
 
-  const entries = entriesFromAiJson(parsed);
   if (!entries.length) {
     console.error("[record] Missing required fields (金额/交易类型)，或多笔数组为空");
+    process.exit(1);
+  }
+
+  if (!dryRun && (!APP_TOKEN || !LEDGER_TABLE)) {
+    console.error("[record] Missing LARK_APP_TOKEN / LARK_LEDGER_TABLE（或 LARK_BOOKKEEPING_* 别名）");
     process.exit(1);
   }
 

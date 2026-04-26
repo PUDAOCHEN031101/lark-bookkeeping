@@ -2,7 +2,7 @@
 /**
  * lark-bookkeeping-daemon.mjs — 飞书聊天记账守护进程
  *
- * 监听指定群聊（LARK_CHAT_ID / LARK_BOOKKEEPING_CHAT_ID）→ AI 解析 → 写多维表 → 发确认
+ * 监听机器人收到的飞书消息 → AI 解析 → 写多维表 → 在原会话发确认
  * 双人记账：发言人映射记账人、按「账户拥有者」解析账户、归属不一致时「确认记账」；见 .env.example
  *
  * 支持的消息格式（直接发送，无需前缀）：
@@ -17,15 +17,19 @@
  */
 
 import { createServer } from "http";
-import { spawn, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readdirSync } from "fs";
 import { join, resolve, dirname } from "path";
+import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { VOUCHER_MODEL_SET } from "./scripts/lib/silicon-voucher-models.mjs";
+import { loadEnvFile } from "./scripts/lib/local-env.mjs";
+import { getLarkCliBin, larkCliWindowsHint, runLarkCliJson, spawnLarkCli, spawnLarkCliSync } from "./scripts/lib/lark-cli-local.mjs";
 import {
   BOOKKEEPING_MULTI_INSTRUCTIONS,
   entriesFromAiJson,
 } from "./scripts/lib/bookkeeping-multi.mjs";
+import { normalizeBookkeepingLine, parseFastBookkeepingLines } from "./scripts/lib/bookkeeping-comma-triple.mjs";
 import { getLlmApiKey, getLlmChatUrl, parseBookkeepingWithLLM } from "./scripts/lib/bookkeeping-parse-llm.mjs";
 import {
   fuzzyMatchAccountRecordId,
@@ -37,12 +41,7 @@ const __dir = dirname(fileURLToPath(import.meta.url));
 
 /** 开源仓库：从项目根目录 .env 注入（与 LARK_* 变量名一致） */
 function loadEnvFromDotenv() {
-  const envPath = resolve(__dir, ".env");
-  if (!existsSync(envPath)) return;
-  for (const line of readFileSync(envPath, "utf8").split("\n")) {
-    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
-  }
+  loadEnvFile(resolve(__dir, ".env"));
 }
 loadEnvFromDotenv();
 
@@ -59,11 +58,16 @@ const LONG_RESTART_MS = Number(process.env.LARK_LONG_RESTART_MS) || 3_000;
 const WEBHOOK_PORT  = Number(process.env.LARK_WEBHOOK_PORT) || 0;
 const WEBHOOK_HOST  = process.env.LARK_WEBHOOK_HOST || "0.0.0.0";
 const VERIFY_TOKEN  = process.env.LARK_VERIFICATION_TOKEN || "";
-const STATE_FILE    = `${process.env.HOME}/.local/share/lark-bookkeeping/state.json`;
-const FEEDBACK_FILE = `${process.env.HOME}/.local/share/lark-bookkeeping/feedback.ndjson`;
-const FEATURE_FILE  = `${process.env.HOME}/.local/share/lark-bookkeeping/feature-requests.ndjson`;
+const DATA_DIR      = process.env.LARK_BOOKKEEPING_DATA_DIR || join(homedir(), ".local", "share", "lark-bookkeeping");
+const STATE_FILE    = process.env.LARK_BOOKKEEPING_STATE_FILE || join(DATA_DIR, "state.json");
+const FEEDBACK_FILE = process.env.LARK_BOOKKEEPING_FEEDBACK_FILE || join(DATA_DIR, "feedback.ndjson");
+const FEATURE_FILE  = process.env.LARK_BOOKKEEPING_FEATURE_FILE || join(DATA_DIR, "feature-requests.ndjson");
 const CHAT_IDS_RAW = process.env.LARK_BOOKKEEPING_CHAT_IDS || "";
 const ENABLE_CHAT_REPLY = process.env.LARK_BOOKKEEPING_ENABLE_CHAT_REPLY === "1";
+const REPLY_AS = (() => {
+  const value = (process.env.LARK_REPLY_AS || "auto").toLowerCase();
+  return ["auto", "bot", "user"].includes(value) ? value : "auto";
+})();
 
 /** 飞书 open_id / user_id / 显示名 → 流水表「记账人」单选值（与多维表选项一致） */
 const USER_OWNER_MAP = (() => {
@@ -233,8 +237,7 @@ function loadState() {
 }
 
 function saveState(state) {
-  const dir = STATE_FILE.substring(0, STATE_FILE.lastIndexOf("/"));
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dirname(STATE_FILE), { recursive: true });
   // keep only last 200 processed IDs to prevent unbounded growth
   if (state.processedIds.length > 200) {
     state.processedIds = state.processedIds.slice(-200);
@@ -258,21 +261,7 @@ function persistState() {
 // ─── lark-cli helper ──────────────────────────────────────────────────────────
 
 function lark(args, timeout = 30_000) {
-  const r = spawnSync("lark-cli", args, {
-    encoding: "utf8",
-    maxBuffer: 10 * 1024 * 1024,
-    timeout,
-    env: { ...process.env },
-  });
-  if (r.error) throw new Error(`lark spawn: ${r.error.message}`);
-  // JSON always goes to stdout; WARN/errors go to stderr.
-  const out = (r.stdout || "").trim();
-  const i = out.indexOf("{");
-  if (i < 0) {
-    const err = (r.stderr || "").trim();
-    throw new Error(`no JSON: ${(err || out).slice(0, 300)}`);
-  }
-  return JSON.parse(out.slice(i));
+  return runLarkCliJson(args, { timeout });
 }
 
 // ─── AI parsing ───────────────────────────────────────────────────────────────
@@ -722,25 +711,40 @@ function deleteRecord(recordId) {
 function sendIM(text, chatId = "", replyToMessageId = "") {
   const cid = chatId || CHAT_ID;
   if (!cid && !replyToMessageId) return;
-  try {
+  const identities = REPLY_AS === "auto" ? ["bot", "user"] : [REPLY_AS];
+  let lastError = null;
+  for (let idx = 0; idx < identities.length; idx++) {
+    const as = identities[idx];
+    const fallbackNote = idx < identities.length - 1 ? ", trying fallback" : "";
     if (ENABLE_CHAT_REPLY && replyToMessageId) {
-      lark([
-        "im", "+messages-reply",
-        "--as", "user",
-        "--message-id", replyToMessageId,
-        "--text", text,
-      ]);
+      try {
+        lark([
+          "im", "+messages-reply",
+          "--as", as,
+          "--message-id", replyToMessageId,
+          "--text", text,
+        ]);
+        return;
+      } catch (e) {
+        lastError = e;
+        log(`IM reply as ${as} failed${fallbackNote}: ${e.message}`);
+      }
     } else if (cid) {
-      lark([
-        "im", "+messages-send",
-        "--as", "user",
-        "--chat-id", cid,
-        "--text", text,
-      ]);
+      try {
+        lark([
+          "im", "+messages-send",
+          "--as", as,
+          "--chat-id", cid,
+          "--text", text,
+        ]);
+        return;
+      } catch (e) {
+        lastError = e;
+        log(`IM send as ${as} failed${fallbackNote}: ${e.message}`);
+      }
     }
-  } catch (e) {
-    log(`IM send failed (non-fatal): ${e.message}`);
   }
+  if (lastError) log(`IM send failed (non-fatal): ${lastError.message}`);
 }
 
 function gatherGuardMismatchesForEntries(entries, bookkeeper) {
@@ -883,7 +887,7 @@ function summarizeRecentRecords(limit = 5) {
 function readRecentJsonLines(file, limit = 5) {
   if (!existsSync(file)) return [];
   try {
-    const lines = readFileSync(file, "utf8").split("\n").map(s => s.trim()).filter(Boolean);
+    const lines = readFileSync(file, "utf8").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const picked = lines.slice(-Math.max(1, Math.min(20, Number(limit) || 5)));
     const rows = [];
     for (const line of picked) {
@@ -1055,13 +1059,12 @@ function downloadMessageImageDataUrl(msg) {
   const fileKey = extractImageUrlFromMessage(msg);
   if (!messageId || !fileKey) throw new Error("missing message_id or image file_key");
 
-  const base = join(process.env.HOME || ".", ".local/share/lark-bookkeeping/tmp");
+  const base = join(DATA_DIR, "tmp");
   mkdirSync(base, { recursive: true });
   const workDir = mkdtempSync(join(base, "ocr-"));
   const relOut = "img.bin";
   try {
-    const r = spawnSync(
-      "lark-cli",
+    const r = spawnLarkCliSync(
       [
         "im", "+messages-resources-download",
         "--as", "bot",
@@ -1070,9 +1073,9 @@ function downloadMessageImageDataUrl(msg) {
         "--type", "image",
         "--output", relOut,
       ],
-      { cwd: workDir, encoding: "utf8", timeout: 60_000, maxBuffer: 20 * 1024 * 1024, env: { ...process.env } },
+      { cwd: workDir, encoding: "utf8", timeout: 60_000, maxBuffer: 20 * 1024 * 1024 },
     );
-    if (r.error) throw new Error(r.error.message);
+    if (r.error) throw new Error(`${r.error.message}.${larkCliWindowsHint()}`);
     if (r.status !== 0) {
       const err = (r.stderr || r.stdout || "").trim();
       throw new Error(err.slice(0, 400) || `exit ${r.status}`);
@@ -1160,7 +1163,7 @@ async function processMessage(msg) {
   const guardKey = ledgerGuardKey(msg);
   const bookkeeper = resolveBookkeeper(msg);
 
-  let text = extractText(msg);
+  let text = normalizeBookkeepingLine(extractText(msg));
   if (msg?.message_type === "image") {
     const imageKey = extractImageUrlFromMessage(msg);
     if (!imageKey) {
@@ -1188,7 +1191,7 @@ async function processMessage(msg) {
       if (!DRY_RUN) sendIM("📷 OCR 未识别到文字。请再发一条文字记账。", replyChatId, replyToMessageId);
       return;
     }
-    text = `【图片OCR】${ocrText}`;
+    text = normalizeBookkeepingLine(`【图片OCR】${ocrText}`);
     log(`OCR: ${text.slice(0, 200)}`);
   } else if (msg?.message_type && msg.message_type !== "text") {
     appendFeatureRequestEntry(`自动记录: 消息类型 ${msg.message_type}`, "暂不支持该消息类型的自动记账");
@@ -1411,8 +1414,19 @@ async function processMessage(msg) {
   }
 
   let parsed;
+  let entries = parseFastBookkeepingLines(textForAI || text);
   try {
-    parsed = await parseWithAI(textForAI || text);
+    if (entries.length) {
+      parsed = entries.length === 1 ? entries[0] : { entries };
+      log(`Local parse: ${JSON.stringify(parsed)}`);
+    } else {
+      parsed = await parseWithAI(textForAI || text);
+      const reconcileSource = textForAI || text;
+      entries = entriesFromAiJson(parsed).map((ent) => {
+        reconcileParsedAccountFromUserText(ent, reconcileSource);
+        return ent;
+      });
+    }
   } catch (e) {
     log(`AI parse error: ${e.message}`);
     if (!DRY_RUN) {
@@ -1425,12 +1439,6 @@ async function processMessage(msg) {
     }
     return;
   }
-
-  const reconcileSource = textForAI || text;
-  const entries = entriesFromAiJson(parsed).map((ent) => {
-    reconcileParsedAccountFromUserText(ent, reconcileSource);
-    return ent;
-  });
 
   // Special commands (AI fallback) — 仅当未解析出记账条目时
   if (entries.length === 0) {
@@ -1720,7 +1728,7 @@ async function handleIncomingMessage(msg, eventId = "") {
 
 async function startLongConnectionLoop() {
   while (true) {
-    log("Long-connection subscribe started");
+    log(`Long-connection subscribe started via ${getLarkCliBin()}`);
     await new Promise((resolve) => {
       const args = [
         "event", "+subscribe",
@@ -1728,9 +1736,8 @@ async function startLongConnectionLoop() {
         "--event-types", "im.message.receive_v1",
         "--quiet",
       ];
-      const child = spawn("lark-cli", args, {
+      const child = spawnLarkCli(args, {
         cwd: process.cwd(),
-        env: { ...process.env },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -1766,7 +1773,7 @@ async function startLongConnectionLoop() {
         resolve();
       });
       child.on("error", (e) => {
-        log(`Long-connection spawn error: ${e.message}`);
+        log(`Long-connection spawn error: ${e.message}.${larkCliWindowsHint()}`);
         resolve();
       });
     });
@@ -1823,28 +1830,38 @@ async function pollLoop() {
 }
 
 async function main() {
-  if (!APP_TOKEN || !LEDGER_TABLE || !ACCOUNT_TABLE || !getLlmApiKey()) {
+  if (!APP_TOKEN || !LEDGER_TABLE || !ACCOUNT_TABLE) {
     throw new Error(
-      "missing required env: LARK_* tables + LLM key (SILICONFLOW_API_KEY or OPENAI_API_KEY or LLM_API_KEY)"
+      "missing required env: LARK_APP_TOKEN/LARK_LEDGER_TABLE/LARK_ACCOUNT_TABLE (or LARK_BOOKKEEPING_* aliases)"
     );
   }
-  if (!CHAT_ID && WEBHOOK_PORT <= 0) {
-    throw new Error("missing required env: LARK_BOOKKEEPING_CHAT_ID (polling mode)");
+  if (EVENT_MODE === "poll" && !CHAT_ID) {
+    throw new Error("missing required env: LARK_CHAT_ID (polling mode only). Use LARK_EVENT_MODE=long for bot auto-reply without a fixed chat ID.");
+  }
+  if (!getLlmApiKey()) {
+    log("LLM key not set. Local shortcut formats still work, e.g. 晚餐，68，微信 / 余额宝转招行500; natural-language parsing requires SILICONFLOW_API_KEY, OPENAI_API_KEY, or LLM_API_KEY.");
   }
 
   MODEL = pickVoucherSafeRouterModel("理解用户说的一句话，识别是否在记账，提取金额和账户信息");
-  log(`Daemon started. Chat: ${CHAT_ID || "(all chats)"}  Model: ${MODEL}  DryRun: ${DRY_RUN}`);
+  log(`Daemon started. Chat: ${CHAT_ID || "(all chats)"}  Model: ${MODEL}  DryRun: ${DRY_RUN}  LarkCli: ${getLarkCliBin()}  ReplyAs: ${REPLY_AS}`);
+  if (larkCliWindowsHint()) log(`Windows lark-cli note:${larkCliWindowsHint()}`);
 
   if (EVENT_MODE === "long") {
     log("Mode: long-connection");
+    log("Long mode listens to bot message events and replies to the source chat. No LARK_CHAT_ID is required unless you want a chat allowlist.");
     await startLongConnectionLoop();
     return;
   }
 
-  if (EVENT_MODE === "webhook" && WEBHOOK_PORT > 0) {
+  if (EVENT_MODE === "webhook") {
+    if (WEBHOOK_PORT <= 0) throw new Error("missing required env: LARK_WEBHOOK_PORT (webhook mode)");
     log("Mode: webhook");
     startWebhookServer();
     return;
+  }
+
+  if (EVENT_MODE !== "poll") {
+    throw new Error(`invalid LARK_EVENT_MODE: ${EVENT_MODE} (expected long, webhook, or poll)`);
   }
 
   log("Mode: polling");

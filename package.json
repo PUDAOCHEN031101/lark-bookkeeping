@@ -1,0 +1,15 @@
+{
+  "name": "lark-bookkeeping",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "start": "node lark-bookkeeping-daemon.mjs",
+    "record": "node lark-record.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

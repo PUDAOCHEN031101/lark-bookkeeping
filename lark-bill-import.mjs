@@ -12,21 +12,17 @@
  * Exit: 0=ok, 1=error
  */
 
-import { spawnSync } from "child_process";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
+import { loadEnvFile } from "./scripts/lib/local-env.mjs";
+import { runLarkCliJson } from "./scripts/lib/lark-cli-local.mjs";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 
 function loadEnv() {
-  const envPath = resolve(__dir, ".env");
-  if (!existsSync(envPath)) return;
-  for (const line of readFileSync(envPath, "utf8").split("\n")) {
-    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
-  }
+  loadEnvFile(resolve(__dir, ".env"));
 }
 loadEnv();
 
@@ -36,12 +32,7 @@ const LEDGER_TABLE = process.env.LARK_LEDGER_TABLE;
 // ─── lark-cli helper ──────────────────────────────────────────────────────────
 
 function lark(args, timeout = 60_000) {
-  const r = spawnSync("lark-cli", args, { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout, env: { ...process.env } });
-  if (r.error) throw new Error(`lark spawn: ${r.error.message}`);
-  const out = (r.stdout || "").trim();
-  const i = out.indexOf("{");
-  if (i < 0) throw new Error(`no JSON: ${out.slice(0, 300)}`);
-  return JSON.parse(out.slice(i));
+  return runLarkCliJson(args, { timeout });
 }
 
 // ─── Category mapping ─────────────────────────────────────────────────────────
